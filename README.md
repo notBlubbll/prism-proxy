@@ -146,7 +146,9 @@ Costs are list-price estimates, not what PrismRouter bills.
 `desktop-usage-panel/` adds a **Prism usage** tab to the session side region:
 summary cards, one row per model, a 24u / 24h / 7d / 30d / all switch, a refresh
 button, and a working composer pill. It reads `/usage` and `/status` from the
-proxy on `127.0.0.1:17334`.
+proxy on `127.0.0.1:17334`. The pill only renders when the current session's
+model belongs to the `prism` provider, so several usage panels never stack
+several "Working" pills.
 
 Install it next to the proxy plugin:
 

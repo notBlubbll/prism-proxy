@@ -298,15 +298,18 @@ function recordUsage(model, result, ms, slot = 0) {
   });
 }
 
-function parseUsageFromText(text) {  if (!text) return null;
+function parseUsageFromText(text) {
+  if (!text) return null;
   const num = (key) => {
     const re = new RegExp(`"${key}"\\s*:\\s*(\\d+)`, "g");
     let last = null, m;
     while ((m = re.exec(text))) last = Number(m[1]);
     return last;
   };
-  const prompt = num("prompt_tokens");
-  const completion = num("completion_tokens");
+  // Chat completions use prompt_tokens/completion_tokens; the Responses API
+  // uses input_tokens/output_tokens.
+  const prompt = num("prompt_tokens") ?? num("input_tokens");
+  const completion = num("completion_tokens") ?? num("output_tokens");
   if (prompt == null && completion == null) return null;
   return {
     prompt: prompt || 0,

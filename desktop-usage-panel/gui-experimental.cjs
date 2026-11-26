@@ -46,6 +46,24 @@ function elapsedSeconds(session) {
   return elapsed >= 0 && elapsed < 24 * 60 * 60 ? elapsed : 0;
 }
 
+function sessionProvider(session) {
+  try {
+    const data = session && session.server && session.server.data;
+    const info = data && data.session && data.session.get(session.id);
+    if (!info) return null;
+    if (typeof info.providerID === "string") return info.providerID;
+    const m = info.model;
+    if (typeof m === "string") return m.includes("/") ? m.split("/")[0] : null;
+    if (m && typeof m === "object") {
+      if (typeof m.providerID === "string") return m.providerID;
+      if (typeof m.id === "string" && m.id.includes("/")) return m.id.split("/")[0];
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
 const WINDOWS = ["24u", "24h", "7d", "30d", "all"];
 
 // Readable names for model ids. Unknown ids fall back to the id itself.
@@ -1063,6 +1081,7 @@ module.exports = {
         order: 5,
         show: (input) => {
           tick();
+          if (sessionProvider(input.session) !== "prism") return undefined;
           const seconds = elapsedSeconds(input.session);
           if (seconds === null) return undefined;
           const s = proxyStatus();
