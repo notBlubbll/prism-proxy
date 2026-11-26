@@ -1442,10 +1442,10 @@ function readRequest(body) {
     json,
     model: typeof json?.model === "string" ? json.model : null,
     stream: json?.stream === true,
-    maxTokens: json?.max_tokens ?? json?.max_completion_tokens ?? null,
+    maxTokens: json?.max_tokens ?? json?.max_completion_tokens ?? json?.max_output_tokens ?? null,
     // Inline images are base64: a single screenshot would otherwise make an
     // ordinary vision request look like a huge compaction prompt.
-    chars: json ? JSON.stringify(json.messages || []).replace(/data:[^"\\]+/g, "data:image").length : 0,
+    chars: json ? JSON.stringify(json.messages || json.input || []).replace(/data:[^"\\]+/g, "data:image").length : 0,
   };
 }
 
@@ -1655,6 +1655,7 @@ async function handle(req, res) {
   let meta = readRequest(body);
   let model = meta.model;
   const isChat = url.pathname.includes("/chat/completions");
+  const isResponses = url.pathname.includes("/responses");
   const sessionId = req.headers["x-opencode-session-id"] || req.headers["x-opencode-session"] || null;
   // With a key pool configured, this request goes out on the key its session is
   // pinned to, and follows that key's windows rather than the shared ones.
@@ -1732,7 +1733,7 @@ async function handle(req, res) {
       return true;
     };
 
-    if (isChat && model && hasLimiter(model, keySlot)) {
+    if ((isChat || isResponses) && model && hasLimiter(model, keySlot)) {
       const rule = OVERFLOW.get(model);
       const queuedAt = Date.now();
       PROXY_STATE.queued++;
@@ -1884,7 +1885,7 @@ function forward(req, res, url, body, model, isChat, opts = {}) {
         // chunk, so an error only blocks when no real content is beside it.
         if (sse && !holdDone && held === null) {
           held = c;
-          const looksError = /"error"\s*:/.test(text) && !/"choices"/.test(text) && !/"(content|reasoning|reasoning_content|text)"\s*:\s*"/.test(text);
+          const looksError = /"error"\s*:\s*(?!null\b)[{"]/.test(text) && !/"choices"/.test(text) && !/"(content|reasoning|reasoning_content|text)"\s*:\s*"/.test(text);
           if (looksError) {
             holdDone = true; // nothing goes to the client from this stream
             const errText = text.replace(/\s+/g, " ").slice(0, 400);

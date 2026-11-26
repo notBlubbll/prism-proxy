@@ -63,9 +63,12 @@ non-empty. Set it in the OpenCode server environment:
 
 Or put the real key there and leave `keys.json` empty.
 
-Responses-only models (`gpt-5*-codex`, `gpt-5*-pro`) are not in the config
-because OpenCode's openai-compatible provider calls `/v1/chat/completions`.
-They are still reachable through the proxy's `/v1/responses` passthrough.
+The provider uses `@opencode-ai/ai/providers/openai-compatible/responses`, so
+OpenCode calls `/v1/responses`. That matters for the GPT-6.x models: the chat
+completions endpoint rejects function tools combined with reasoning
+(`Function tools with reasoning_effort are not supported ...`), while the
+Responses API accepts them. Responses-only models (`gpt-5*-codex`,
+`gpt-5*-pro`) can be added to the `models` map as well.
 
 ## Keys
 

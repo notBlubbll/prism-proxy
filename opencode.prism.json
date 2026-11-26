@@ -3,7 +3,7 @@
     "providers": {
         "prism": {
             "name": "PrismRouter",
-            "package": "@opencode-ai/ai/providers/openai-compatible",
+            "package": "@opencode-ai/ai/providers/openai-compatible/responses",
             "settings": {
                 "baseURL": "http://127.0.0.1:17334/v1",
                 "apiKey": "{env:PRISM_API_KEY}",
