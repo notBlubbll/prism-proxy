@@ -1,0 +1,8 @@
+node_modules/
+keys.json
+.env
+.env.*
+.prism-proxy.log
+.prism-usage.json
+.prism-usage.jsonl
+*.log

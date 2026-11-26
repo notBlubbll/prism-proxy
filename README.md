@@ -1,0 +1,152 @@
+# prism-proxy
+
+An OpenCode V2 plugin and standalone daemon for the PrismRouter
+(`claude.c00l.site`) doway endpoint. It adds a **global 30 requests/minute** and
+**10M tokens/minute** sliding window per key, so OpenCode's fan-out (subagents,
+retries, parallel tool calls) queues instead of hitting the gateway's `429`.
+It also owns the credentials through a small key pool.
+
+The request body (including the model id) is forwarded byte-exact. The proxy
+does not rewrite prompts or model names.
+
+## Why
+
+PrismRouter meters the whole key, not each model: `30 requests per minute` plus
+a token budget. OpenCode fans out requests and surfaces the `429` as a failed
+turn. The proxy estimates each request's size, reserves a slot in both windows,
+waits for room, and forwards only when the budget allows it.
+
+## Limits
+
+| Window | Default | Env |
+| --- | --- | --- |
+| Requests | 30 / 60s per key | `PRISM_PROXY_GLOBAL_LIMITS` |
+| Tokens | 10,000,000 / 60s per key | `PRISM_PROXY_GLOBAL_TOKEN_LIMITS` |
+
+The windows are global across models. Per-model limits are available with
+`PRISM_PROXY_LIMITS` and `PRISM_PROXY_TOKEN_LIMITS` (format `model=30/60s`).
+Token use is estimated from the prompt size and reconciled from the upstream
+`usage` once the response completes. A prompt larger than the whole budget is
+clamped and queued, never rejected.
+
+## Install
+
+```sh
+git clone https://github.com/notBlubbll/prism-proxy.git
+cd prism-proxy
+cp keys.json.example keys.json   # then paste the key
+node index.js                    # or: bun index.js
+```
+
+`keys.json` is git-ignored. The proxy listens on `127.0.0.1:17334` and forwards
+to `https://claude.c00l.site/doway/v1`.
+
+The doway route expects **bare model ids** (`gpt-6.2-sol`, not
+`doway/gpt-6.2-sol`). The root `/v1` route on the same host rejects this key
+with `403 This API key is not allowed to use the root provider`; `/doway/v1`
+is the route that works.
+
+## OpenCode
+
+Copy [`opencode.prism.json`](./opencode.prism.json) into your OpenCode config,
+or merge its `providers.prism` block. It points at
+`http://127.0.0.1:17334/v1` and includes 20 chat models with models.dev pricing,
+context limits and reasoning variants.
+
+The provider's `apiKey` is `{env:PRISM_API_KEY}`. With a key in `keys.json` the
+proxy replaces whatever the client sends, so the env var only needs to be
+non-empty. Set it in the OpenCode server environment:
+
+```powershell
+[Environment]::SetEnvironmentVariable("PRISM_API_KEY", "unused-with-a-key-pool", "User")
+```
+
+Or put the real key there and leave `keys.json` empty.
+
+Responses-only models (`gpt-5*-codex`, `gpt-5*-pro`) are not in the config
+because OpenCode's openai-compatible provider calls `/v1/chat/completions`.
+They are still reachable through the proxy's `/v1/responses` passthrough.
+
+## Keys
+
+`keys.json` supports up to 8 keys. The pool exists so a second key is a second
+set of windows, but one key is the normal setup:
+
+```json
+{
+  "keys": ["sk-ant-..."],
+  "pins": {},
+  "seen": {}
+}
+```
+
+One session is pinned to one key and keeps using it. New sessions take the key
+with the fewest live sessions. Pins expire after 14 days. `PRISM_PROXY_KEYS`
+adds keys from the environment; `PRISM_PROXY_KEYS_FILE` moves the file.
+
+`GET /keys` shows masked keys, pins and live sessions. `POST /keys` accepts
+`{"add":"..."}`, `{"set":1,"key":"..."}`, `{"remove":1}` and
+`{"pin":{"session":"ses_...","key":1}}`. `GET /keys/reveal?slot=1` returns the
+full key to a loopback client only.
+
+## Billing
+
+`/usage` reports requests, input/output/cached/reasoning tokens, estimated USD
+cost, time-to-first-token and decode speed per model. Prices come from
+[models.dev](https://models.dev) (the `opencode` table, falling back to
+`openai`), including the 272K-context tier. Override any model with:
+
+```sh
+PRISM_PROXY_PRICING="gpt-6.2-sol=2/10/0.1"
+```
+
+Costs are list-price estimates, not what PrismRouter bills.
+
+## Endpoints
+
+- `GET /healthz` -> `prism-proxy OK`
+- `GET /status` -> limits, queue, per-model counters, key slots, global window
+- `GET /usage` -> 24u / 24h / 7d / 30d / all windows
+- `GET /keys` -> masked pool and session pins
+- `POST /keys` -> add, set, remove, pin
+- `POST /admin/reload` with `x-prism-admin: 1` -> hot-reload `index.js`
+
+## Env vars
+
+| Var | Default | Meaning |
+| --- | --- | --- |
+| `PRISM_PROXY_PORT` | `17334` | listen port (127.0.0.1 only) |
+| `PRISM_PROXY_UPSTREAM` | `https://claude.c00l.site/doway/v1` | upstream base URL |
+| `PRISM_PROXY_KEYS` | - | comma list added to the pool |
+| `PRISM_PROXY_KEYS_FILE` | `keys.json` | key/pin store |
+| `PRISM_PROXY_GLOBAL_LIMITS` | `global=30/60s` | global request window |
+| `PRISM_PROXY_GLOBAL_TOKEN_LIMITS` | `global=10000000/60s` | global token window |
+| `PRISM_PROXY_LIMITS` | empty | per-model request windows |
+| `PRISM_PROXY_TOKEN_LIMITS` | empty | per-model token windows |
+| `PRISM_PROXY_PRICING` | models.dev table | `model=in/out/cached` USD per 1M |
+| `PRISM_PROXY_RL_BUDGET_MS` | `600000` | 429 wait ceiling per request |
+| `PRISM_PROXY_VISION` | on | `0` disables caption fallback |
+| `PRISM_PROXY_VISION_TARGETS` | empty | text-only models to caption for |
+| `PRISM_PROXY_VISION_MODEL` | `gpt-5.4-nano` | captioning model |
+| `PRISM_PROXY_VISION_PROMPT` | built-in | caption prompt override |
+| `PRISM_PROXY_COMPACTION` | on | `0` disables compaction protection |
+| `PRISM_PROXY_COMPACTION_MODEL` | `gpt-6.2-sol` | handoff for blocked summaries |
+| `PRISM_PROXY_COMPACTION_MIN_BYTES` | `20000` | prompt size that marks a tool-less request as compaction |
+| `PRISM_PROXY_OVERFLOW` | none | `from=to:wait` spill rules |
+| `PRISM_PROXY_IMAGE_SHRINK_MB` | `8` | body size where the oldest images are replaced |
+| `PRISM_PROXY_MAX_IMAGES` | `6` | max image parts kept in a request |
+| `PRISM_PROXY_PING_TIMEOUT_MS` | `30000` | hard limit for one ping |
+| `PRISM_PROXY_PING_WAIT_MS` | `180000` | slot wait for a ping |
+
+## Files
+
+- `index.js` - proxy, limiter, key pool, usage accounting
+- `opencode.prism.json` - OpenCode provider block
+- `keys.json.example` - placeholder key file
+- `keys.json` - real key, git-ignored
+- `.prism-usage.json` / `.prism-usage.jsonl` - usage history, git-ignored
+- `.prism-proxy.log` - log, git-ignored
+
+## License
+
+MIT

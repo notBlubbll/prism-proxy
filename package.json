@@ -1,0 +1,12 @@
+{
+  "name": "prism-proxy",
+  "version": "1.0.0",
+  "private": true,
+  "description": "OpenAI-compatible proxy for PrismRouter (c00l.site) with a global 30 RPM / 10M TPM limiter and a key pool.",
+  "type": "module",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "license": "MIT"
+}
