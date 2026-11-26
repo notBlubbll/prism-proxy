@@ -12,39 +12,12 @@
 // Plain DOM, no JSX and no build step: the panel builds its nodes once and
 // updates them in place.
 const { Plugin, Panel, MenuItem, Command, ComposerPill, Registry, Contract } = require("@opencode/plugin/gui");
-const { createSignal } = require("solid-js");
+const { createComponent, createEffect, createSignal, onCleanup } = require("solid-js");
+const { insert } = require("solid-js/web");
 
 // Live retry state from the proxy's /status, read by the composer pill. One
 // signal for every window, refreshed once a second.
 const [proxyStatus, setProxyStatus] = createSignal(null);
-// One shared 1s ticker; reading `tick()` in a pill makes the host re-run it.
-const [tick, setTick] = createSignal(0);
-
-function formatSeconds(total) {
-  if (total < 60) return `${total}s`;
-  const minutes = Math.floor(total / 60);
-  const seconds = total % 60;
-  return seconds ? `${minutes}m ${seconds}s` : `${minutes}m`;
-}
-
-// Elapsed time of the routed session, or null when it is not working.
-function elapsedSeconds(session) {
-  const data = session && session.server && session.server.data;
-  if (!data) return null;
-  const id = session.id;
-  let running = false;
-  try {
-    running = typeof data.session.status === "function" && data.session.status(id) === "running";
-  } catch {}
-  const info = data.session.get(id);
-  const busy = info && info.time && info.time.busy;
-  const idle = info && info.time && info.time.idle;
-  const byTime = typeof busy === "number" && (typeof idle !== "number" || busy > idle);
-  if (!running && !byTime) return null;
-  if (typeof busy !== "number") return 0;
-  const elapsed = Math.floor((Date.now() - busy) / 1000);
-  return elapsed >= 0 && elapsed < 24 * 60 * 60 ? elapsed : 0;
-}
 
 const WINDOWS = ["24u", "24h", "7d", "30d", "all"];
 
@@ -86,11 +59,10 @@ const KEY_MASK = "••••••••••••••••";
 const COLUMNS = [
   { key: "model", label: "Model", align: "left" },
   { key: "requests", label: "Req", align: "right" },
-  { key: "input", label: "In", align: "right" },
+  { key: "input", label: "Uncached", align: "right", title: "Input tokens not served from cache" },
+  { key: "cached", label: "Cached", align: "right", title: "Input tokens served from cache; hover for the cache-hit percentage" },
   { key: "output", label: "Out", align: "right" },
   { key: "reasoning", label: "Reason", align: "right" },
-  { key: "cached", label: "Cached", align: "right",
-    title: "Share of input tokens served from the provider's prompt cache: cached ÷ input. Input already includes the cached tokens." },
   { key: "avgTps", label: "tok/s", align: "right",
     title: "Decode speed: output tokens after the first one ÷ time between the first and last streamed token. Excludes time to first token, and replies under 16 tokens." },
   { key: "ttftMs", label: "ttft", align: "right",
@@ -116,21 +88,16 @@ function secs(ms) {
   return (v / 1000).toFixed(3) + "s";
 }
 
-// Cached share of the prompt. The gateway reports prompt tokens including the
-// cached ones (OpenAI-style usage), so the ratio is simply cached / input.
-function cachedPct(cached, input) {
-  const c = Number(cached) || 0;
-  const i = Number(input) || 0;
-  if (i <= 0) return "—";
-  return ((c / i) * 100).toFixed(1) + "%";
-}
-
-function cachedTitle(cached, input) {
-  const c = Number(cached) || 0;
-  const i = Number(input) || 0;
-  if (i <= 0) return "no input tokens in this window";
-  return `${c.toLocaleString()} cached ÷ ${i.toLocaleString()} input tokens = ${((c / i) * 100).toFixed(2)}%\n` +
-    "Imported history is left out: it has no cache data. Claude models only cache when the request carries cache_control (compatibility.cacheFormat).";
+function inputBreakdown(stats) {
+  const total = stats.input || 0;
+  const measured = stats.inputReal ?? (stats.seeded ? 0 : total);
+  const cached = Math.min(measured, stats.cachedReal ?? stats.cached ?? 0);
+  const uncached = measured - cached;
+  const unknown = Math.max(0, total - measured);
+  const details = [`${total.toLocaleString()} total input`, `${uncached.toLocaleString()} uncached`, `${cached.toLocaleString()} cached`];
+  if (measured) details.push(`${(100 * cached / measured).toFixed(1)}% cache hit rate on measured input`);
+  if (unknown) details.push(`${unknown.toLocaleString()} input tokens with unknown cache status`);
+  return { uncached, cached, unknown, title: details.join("\n") };
 }
 
 function tpsTitle(s) {
@@ -164,7 +131,7 @@ function money(n) {
 
 const BORDER = "1px solid rgba(127,127,127,.18)";
 
-function buildPanel(endpoint, refreshMs, headingText, getSessionId, getTitle) {
+function buildPanel(ui, endpoint, refreshMs, headingText, getSessionId, getTitle) {
   const sessionId = () => {
     try { return typeof getSessionId === "function" ? getSessionId() : null; } catch { return null; }
   };
@@ -174,7 +141,7 @@ function buildPanel(endpoint, refreshMs, headingText, getSessionId, getTitle) {
   const root = document.createElement("div");
   root.style.cssText = [
     "padding:14px",
-    "font:12px/1.5 ui-sans-serif,system-ui,-apple-system,sans-serif",
+    "font-family:inherit;font-size:12px;line-height:1.5",
     "color:inherit",
     "height:100%",
     "overflow:auto",
@@ -188,6 +155,40 @@ function buildPanel(endpoint, refreshMs, headingText, getSessionId, getTitle) {
     "-webkit-user-select:text",
     "cursor:auto",
   ].join(";");
+  root.className = "prism-usage-panel";
+  const style = document.createElement("style");
+  style.textContent = `
+    .prism-usage-panel .prism-live-rates { display:grid; grid-template-columns:repeat(auto-fit,minmax(130px,1fr)); gap:8px 16px; }
+    .prism-usage-panel .prism-rate { display:grid; grid-template-columns:auto 1fr; align-items:baseline; gap:3px 6px; }
+    .prism-usage-panel .prism-rate span:last-of-type { text-align:end; font-variant-numeric:tabular-nums; }
+    .prism-usage-panel .prism-rate-track { position:relative; grid-column:1/-1; height:4px; overflow:hidden; border-radius:2px; background:color-mix(in srgb,currentColor 13%,transparent); }
+    .prism-usage-panel .prism-rate-track::after { content:""; position:absolute; inset:0; background:currentColor; transform-origin:left center; transform:scaleX(var(--rate-fill,0)); }
+    .prism-usage-panel .prism-rate-track meter { position:absolute; width:1px; height:1px; clip-path:inset(50%); }
+    @media (prefers-reduced-motion:no-preference) {
+      .prism-usage-panel .prism-rate-track::after { transition:transform 240ms cubic-bezier(.22,1,.36,1); }
+    }
+    .prism-usage-panel .prism-ranges { position:relative; display:inline-grid; grid-auto-flow:column; grid-auto-columns:1fr; }
+    .prism-usage-panel .prism-ranges::after { content:""; position:absolute; pointer-events:none; left:0; bottom:0; width:calc(100% / var(--range-count)); height:2px; background:currentColor; border-radius:2px; transform:translateX(calc(var(--range-index,0) * 100%)) scaleX(.52); }
+    @media (prefers-reduced-motion:no-preference) {
+      .prism-usage-panel .prism-ranges[data-animate]::after { transition:transform 160ms cubic-bezier(.22,1,.36,1); }
+    }
+    .prism-usage-panel .prism-range, .prism-usage-panel .prism-key-heading { font:inherit; color:inherit; border:none; border-radius:4px; background:transparent; cursor:pointer; }
+    .prism-usage-panel .prism-range { padding:4px 6px; white-space:nowrap; color:var(--text-weak,inherit); }
+    .prism-usage-panel .prism-key-heading:hover { background:var(--surface-base-hover,color-mix(in srgb,currentColor 8%,transparent)); }
+    .prism-usage-panel .prism-range:hover, .prism-usage-panel .prism-range[aria-pressed="true"] { color:inherit; }
+    .prism-usage-panel :is(button,input,select):focus-visible { outline:2px solid var(--border-focus,currentColor); outline-offset:1px; }
+    .prism-usage-panel .prism-key-heading { display:flex; align-items:center; gap:6px; padding:5px 4px; text-align:start; font-weight:600; }
+  `;
+  root.appendChild(style);
+  function iconAction(label, props) {
+    const slot = document.createElement("span");
+    slot.style.display = "inline-flex";
+    insert(slot, createComponent(ui.Tooltip, {
+      get value() { return label(); },
+      get children() { return createComponent(ui.IconButton, props); },
+    }));
+    return slot;
+  }
 
   // ---- header -------------------------------------------------------------
   const head = document.createElement("div");
@@ -200,30 +201,32 @@ function buildPanel(endpoint, refreshMs, headingText, getSessionId, getTitle) {
 
   let win = "24u";
   const buttons = {};
+  const ranges = document.createElement("div");
+  ranges.className = "prism-ranges";
+  ranges.style.setProperty("--range-count", WINDOWS.length);
+  ranges.setAttribute("role", "group");
+  ranges.setAttribute("aria-label", "Usage time range");
+  head.appendChild(ranges);
   for (const w of WINDOWS) {
     const b = document.createElement("button");
     b.type = "button";
-    b.textContent = w;
-    if (w === "24u") b.title = "Since 00:00 UTC today";
+    b.textContent = w === "24u" ? "Today" : w === "all" ? "All" : w;
+    if (w === "24u") b.title = "Since midnight UTC";
     if (w === "24h") b.title = "Last 24 hours";
-    b.style.cssText = [
-      "padding:3px 9px",
-      "border-radius:999px",
-      "border:1px solid rgba(127,127,127,.3)",
-      "background:transparent",
-      "color:inherit",
-      "cursor:pointer",
-      "font:inherit",
-      "line-height:1.5",
-      "transition:background .12s",
-    ].join(";");
-    b.onclick = () => { win = w; paint(); };
+    b.className = "prism-range";
+    b.onclick = (event) => {
+      if (win === w) return;
+      win = w;
+      ranges.toggleAttribute("data-animate", event.detail > 0);
+      ranges.style.setProperty("--range-index", WINDOWS.indexOf(w));
+      paint();
+    };
     buttons[w] = b;
-    head.appendChild(b);
+    ranges.appendChild(b);
   }
 
   // Key filter next to the window pills: "all" (combined, the default) or one key.
-  let keyView = "all";
+  const [keyView, setKeyView] = createSignal("all");
   const keyFilterBox = document.createElement("span");
   keyFilterBox.style.cssText = "display:inline-flex;gap:4px;margin-left:6px;padding-left:8px;border-left:" + BORDER;
   const keySelect = document.createElement("select");
@@ -232,18 +235,18 @@ function buildPanel(endpoint, refreshMs, headingText, getSessionId, getTitle) {
     "padding:3px 8px", "border-radius:999px", "border:1px solid rgba(127,127,127,.3)",
     "background:transparent", "color:inherit", "cursor:pointer", "font:inherit", "line-height:1.5",
   ].join(";");
-  keySelect.onchange = () => { keyView = keySelect.value; paint(); };
+  keySelect.onchange = () => { setKeyView(keySelect.value); paint(); };
   keyFilterBox.appendChild(keySelect);
   let keyOptionsSig = "";
   function renderKeyFilter() {
     if (keys.length < 2) {
-      keyView = "all";
+      setKeyView("all");
       keyFilterBox.remove();
       return;
     }
     if (!keyFilterBox.parentNode) head.insertBefore(keyFilterBox, refreshBtn);
     const ids = ["all", ...keys.map((k) => String(k.index))];
-    if (!ids.includes(keyView)) keyView = "all";
+    if (!ids.includes(keyView())) setKeyView("all");
     const sig = ids.join(",");
     if (sig !== keyOptionsSig) {
       keyOptionsSig = sig;
@@ -255,27 +258,80 @@ function buildPanel(endpoint, refreshMs, headingText, getSessionId, getTitle) {
         keySelect.appendChild(o);
       }
     }
-    keySelect.value = keyView;
+    keySelect.value = keyView();
   }
 
-  const refreshBtn = document.createElement("button");
-  refreshBtn.type = "button";
-  refreshBtn.textContent = "↻";
-  refreshBtn.title = "Refresh now";
-  refreshBtn.setAttribute("aria-label", "Refresh now");
-  refreshBtn.style.cssText = [
-    "padding:3px 9px",
-    "border-radius:999px",
-    "border:1px solid rgba(127,127,127,.3)",
-    "background:transparent",
-    "color:inherit",
-    "cursor:pointer",
-    "font:inherit",
-    "line-height:1.5",
-  ].join(";");
-  refreshBtn.onclick = () => { refresh(); };
+  const [refreshing, setRefreshing] = createSignal(false);
+  const refreshBtn = iconAction(() => "Refresh usage", {
+    icon: "refresh", label: "Refresh usage", variant: "ghost", size: "small",
+    get busy() { return refreshing(); }, onClick: () => refresh(),
+  });
   head.appendChild(refreshBtn);
   root.appendChild(head);
+
+  const live = document.createElement("section");
+  live.setAttribute("aria-label", "Live rate limits");
+  const caption = document.createElement("strong");
+  caption.textContent = "Live rate limits";
+  const rates = document.createElement("div");
+  rates.className = "prism-live-rates";
+  live.append(caption, rates);
+  root.appendChild(live);
+  const rateRows = new Map();
+  createEffect(() => {
+    const status = proxyStatus();
+    if (!status?.globalLimits || !status.global) {
+      rates.textContent = "Live counters unavailable";
+      rateRows.clear();
+      return;
+    }
+    const count = Math.max(1, status.keys || 1);
+    const visible = new Set();
+    for (let slot = 1; slot <= count; slot++) {
+      if (keyView() !== "all" && keyView() !== String(slot)) continue;
+      const snapshot = status.global[`global|${slot}`] ?? (count === 1 ? status.global.global : undefined);
+      for (const [name, kind, field] of [["RPM", "requests", "used"], ["TPM", "tokens", "tokensUsed"]]) {
+        const limit = /^(\d+)\/([\d.]+)s$/.exec(status.globalLimits[kind]);
+        const label = limit && Number(limit[2]) !== 60 ? `${kind} / ${limit[2]}s` : name;
+        const title = count > 1 ? `Key ${slot} · ${label}` : label;
+        visible.add(title);
+        if (!rateRows.has(title)) {
+          const row = document.createElement("div");
+          row.className = "prism-rate";
+          const heading = document.createElement("span");
+          heading.textContent = title;
+          const value = document.createElement("span");
+          const meter = document.createElement("meter");
+          meter.setAttribute("aria-label", title);
+          const track = document.createElement("div");
+          track.className = "prism-rate-track";
+          track.appendChild(meter);
+          row.append(heading, value, track);
+          rateRows.set(title, { row, value, meter, track });
+        }
+        const { row, value, meter, track } = rateRows.get(title);
+        track.hidden = !limit;
+        if (!limit) {
+          row.removeAttribute("title");
+          value.textContent = status.globalLimits[kind] === "off" ? "Off" : "Unavailable";
+          continue;
+        }
+        const cap = Number(limit[1]) / count;
+        const used = snapshot?.[field] ?? 0;
+        meter.max = cap;
+        meter.value = used;
+        track.style.setProperty("--rate-fill", meter.value / meter.max);
+        row.title = `${used.toLocaleString()} of ${cap.toLocaleString()} ${kind} in the last ${limit[2]} seconds`;
+        meter.setAttribute("aria-valuetext", row.title);
+        value.textContent = `${fmt(used)} / ${fmt(cap)}`;
+      }
+    }
+    const rows = Array.from(visible, title => rateRows.get(title).row);
+    if (rates.childNodes.length !== rows.length || rows.some((row, i) => rates.children[i] !== row)) {
+      rates.replaceChildren(...rows);
+      for (const title of rateRows.keys()) if (!visible.has(title)) rateRows.delete(title);
+    }
+  });
 
   // ---- summary cards ------------------------------------------------------
   const cards = document.createElement("div");
@@ -283,7 +339,7 @@ function buildPanel(endpoint, refreshMs, headingText, getSessionId, getTitle) {
   root.appendChild(cards);
 
   const cardValues = {};
-  for (const [key, label] of [["requests", "Requests"], ["input", "Input"], ["output", "Output"], ["cost", "Cost"]]) {
+  for (const [key, label] of [["requests", "Requests"], ["input", "Uncached input"], ["cached", "Cached input"], ["output", "Output"], ["cost", "Cost"]]) {
     const card = document.createElement("div");
     card.style.cssText = [
       "padding:9px 11px",
@@ -420,33 +476,25 @@ function buildPanel(endpoint, refreshMs, headingText, getSessionId, getTitle) {
   const pingRow = document.createElement("div");
   pingRow.style.cssText = "display:flex;align-items:center;gap:8px";
 
-  const pingBtn = document.createElement("button");
-  pingBtn.type = "button";
-  pingBtn.textContent = "Ping models";
-  pingBtn.style.cssText = [
-    "padding:4px 12px",
-    "border-radius:8px",
-    "border:1px solid rgba(127,127,127,.35)",
-    "background:rgba(127,127,127,.08)",
-    "color:inherit",
-    "cursor:pointer",
-    "font:inherit",
-    "font-weight:600",
-  ].join(";");
-  pingRow.appendChild(pingBtn);
+  const [pingBusy, setPingBusy] = createSignal(false);
+  insert(pingRow, createComponent(ui.Button, {
+    variant: "neutral", size: "small", type: "button", onClick: ping,
+    get busy() { return pingBusy(); },
+    get disabled() { return pingBusy(); },
+    get children() { return pingBusy() ? "Pinging…" : "Ping models"; },
+  }));
 
   // One-click copy of the whole result as tab-separated rows, so it pastes into
   // a sheet or chat. The table itself is selectable too.
   const COPY_LABEL = "Copy for Discord";
-  const copyBtn = document.createElement("button");
-  copyBtn.type = "button";
-  copyBtn.textContent = COPY_LABEL;
-  copyBtn.disabled = true;
-  copyBtn.style.cssText = [
-    "padding:4px 10px", "border-radius:8px", "border:1px solid rgba(127,127,127,.35)",
-    "background:transparent", "color:inherit", "cursor:pointer", "font:inherit",
-    "font-weight:600", "opacity:.45",
-  ].join(";");
+  const [canCopy, setCopyState] = createSignal(false);
+  const [copyLabel, setCopyLabel] = createSignal(COPY_LABEL);
+  let copyTimer;
+  const copyBtn = iconAction(copyLabel, {
+    get icon() { return copyLabel() === "Copied" ? "check" : copyLabel() === "Copy failed" ? "warning" : "copy"; },
+    get label() { return copyLabel(); }, get disabled() { return !canCopy(); },
+    size: "small", variant: "ghost", onClick: copyResults,
+  });
   pingRow.appendChild(copyBtn);
 
   const pingNote = document.createElement("span");
@@ -476,12 +524,7 @@ function buildPanel(endpoint, refreshMs, headingText, getSessionId, getTitle) {
     const body = [head, ...rows].map(line).join("\n").replace(/```/g, "'''");
     return "```\n" + body + "\n```";
   }
-  const setCopyState = (enabled) => {
-    copyBtn.disabled = !enabled;
-    copyBtn.style.opacity = enabled ? "1" : ".45";
-    copyBtn.textContent = COPY_LABEL;
-  };
-  copyBtn.onclick = async () => {
+  async function copyResults() {
     if (!pingText) return;
     // execCommand through a focused textarea first: it does not depend on the
     // clipboard permission the desktop shell may deny.
@@ -498,17 +541,14 @@ function buildPanel(endpoint, refreshMs, headingText, getSessionId, getTitle) {
     if (!ok && navigator.clipboard?.writeText) {
       try { await navigator.clipboard.writeText(pingText); ok = true; } catch {}
     }
-    copyBtn.textContent = ok ? "Copied" : "Copy failed";
-    setTimeout(() => { copyBtn.textContent = COPY_LABEL; }, 1400);
-  };
+    setCopyLabel(ok ? "Copied" : "Copy failed");
+    clearTimeout(copyTimer);
+    copyTimer = setTimeout(() => setCopyLabel(COPY_LABEL), 1400);
+  }
 
-  let pingBusy = false;
   async function ping() {
-    if (pingBusy) return;
-    pingBusy = true;
-    pingBtn.disabled = true;
-    pingBtn.style.opacity = ".55";
-    pingBtn.textContent = "Pinging…";
+    if (pingBusy()) return;
+    setPingBusy(true);
     pingOut.textContent = "";
     pingText = "";
     setCopyState(false);
@@ -569,13 +609,9 @@ function buildPanel(endpoint, refreshMs, headingText, getSessionId, getTitle) {
       err.style.cssText = "opacity:.6";
       pingOut.appendChild(err);
     } finally {
-      pingBusy = false;
-      pingBtn.disabled = false;
-      pingBtn.style.opacity = "1";
-      pingBtn.textContent = "Ping models";
+      setPingBusy(false);
     }
   }
-  pingBtn.onclick = ping;
 
   // ---- keys ---------------------------------------------------------------
   // The gateway meters each key separately, so a second key is a second set of
@@ -586,36 +622,37 @@ function buildPanel(endpoint, refreshMs, headingText, getSessionId, getTitle) {
   const keyBox = document.createElement("div");
   keyBox.style.cssText = "border-top:" + BORDER + ";padding-top:10px;display:flex;flex-direction:column;gap:6px";
 
-  const keyHead = document.createElement("div");
+  const keyHead = document.createElement("button");
   // Collapsed by default: keys are masked, but there is no reason to keep them on
   // screen. Click the heading to open.
-  let keysOpen = false;
-  keyHead.style.cssText = "font-size:11px;font-weight:650;letter-spacing:.04em;text-transform:uppercase;opacity:.55;cursor:pointer;user-select:none;-webkit-user-select:none";
-  keyHead.setAttribute("role", "button");
-  keyHead.tabIndex = 0;
+  const [keysOpen, setKeysOpen] = createSignal(false);
+  keyHead.type = "button";
+  keyHead.className = "prism-key-heading";
+  insert(keyHead, createComponent(ui.Icon, { get name() { return keysOpen() ? "chevron-down" : "chevron-right"; }, size: "small" }));
+  const keyCaption = document.createElement("span");
+  keyHead.appendChild(keyCaption);
   keyBox.appendChild(keyHead);
+  const keyBody = document.createElement("div");
+  keyBody.id = "prism-keys-" + crypto.randomUUID();
+  keyHead.setAttribute("aria-controls", keyBody.id);
+  keyBox.appendChild(keyBody);
 
   const keyList = document.createElement("div");
   keyList.style.cssText = "display:flex;flex-direction:column;gap:3px";
-  keyBox.appendChild(keyList);
+  keyBody.appendChild(keyList);
 
   const keyNote = document.createElement("div");
   keyNote.style.cssText = "opacity:.5;font-size:11px";
   keyNote.textContent = "saved to keys.json - each session sticks to one key";
-  keyBox.appendChild(keyNote);
+  keyBody.appendChild(keyNote);
   root.appendChild(keyBox);
 
   function paintKeysOpen() {
-    keyHead.textContent = `${keysOpen ? "▾" : "▸"} Keys` + (keys.length ? ` · ${keys.length}` : "");
-    keyHead.setAttribute("aria-expanded", String(keysOpen));
-    keyHead.title = keysOpen ? "Hide keys" : "Show keys";
-    keyList.style.display = keysOpen ? "flex" : "none";
-    keyNote.style.display = keysOpen ? "block" : "none";
+    keyCaption.textContent = "Keys" + (keys.length ? ` · ${keys.length}` : "");
+    keyHead.setAttribute("aria-expanded", String(keysOpen()));
+    keyBody.style.cssText = `display:${keysOpen() ? "grid" : "none"};gap:8px;padding:2px 4px`;
   }
-  keyHead.onclick = () => { keysOpen = !keysOpen; paintKeysOpen(); };
-  keyHead.onkeydown = (e) => {
-    if (e.key === "Enter" || e.key === " ") { e.preventDefault(); keyHead.onclick(); }
-  };
+  keyHead.onclick = () => { setKeysOpen(!keysOpen()); paintKeysOpen(); };
   paintKeysOpen();
 
   // Rows exist only for keys that are configured. Each row is one masked field
@@ -779,7 +816,7 @@ function buildPanel(endpoint, refreshMs, headingText, getSessionId, getTitle) {
   };
   addRow.appendChild(addInput);
   addRow.appendChild(addBtn);
-  keyBox.appendChild(addRow);
+  keyBody.appendChild(addRow);
 
   // Saves never touch the add field or the rows' edit state: they only update the
   // key list, pins, and the note.
@@ -874,8 +911,7 @@ function buildPanel(endpoint, refreshMs, headingText, getSessionId, getTitle) {
 
   function paint() {
     for (const [k, b] of Object.entries(buttons)) {
-      b.style.background = k === win ? "rgba(127,127,127,.22)" : "transparent";
-      b.style.fontWeight = k === win ? "650" : "400";
+      b.setAttribute("aria-pressed", String(k === win));
     }
 
     table.textContent = "";
@@ -895,14 +931,18 @@ function buildPanel(endpoint, refreshMs, headingText, getSessionId, getTitle) {
 
     renderKeyFilter();
     // "all keys" is the combined window; a key shows only what ran on that key.
-    const perKey = keyView !== "all" && data.perKey && data.perKey[win] && data.perKey[win][keyView];
-    const w = keyView === "all"
+    const selectedKey = keyView();
+    const perKey = selectedKey !== "all" && data.perKey && data.perKey[win] && data.perKey[win][selectedKey];
+    const w = selectedKey === "all"
       ? data.windows && data.windows[win]
       : (perKey ? perKey.total : { requests: 0, input: 0, output: 0, reasoning: 0, cached: 0, cost: 0 });
     if (!w) { footer.textContent = "no data yet for " + win; return; }
 
     cardValues.requests.textContent = String(w.requests);
-    cardValues.input.textContent = fmt(w.input);
+    const inputs = inputBreakdown(w);
+    cardValues.input.textContent = fmt(inputs.uncached);
+    cardValues.cached.textContent = fmt(inputs.cached);
+    cardValues.input.parentElement.title = cardValues.cached.parentElement.title = inputs.title;
     cardValues.output.textContent = fmt(w.output);
     cardValues.cost.textContent = money(w.cost);
 
@@ -919,7 +959,7 @@ function buildPanel(endpoint, refreshMs, headingText, getSessionId, getTitle) {
     // gateway no longer lists) has no price entry, so its history is not shown here.
     const offered = data.pricing ? new Set(Object.keys(data.pricing)) : null;
     const models = {};
-    const rowsSrc = keyView === "all" ? ((data.models && data.models[win]) || {}) : (perKey ? perKey.models : {});
+    const rowsSrc = selectedKey === "all" ? ((data.models && data.models[win]) || {}) : (perKey ? perKey.models : {});
     for (const [name, m] of Object.entries(rowsSrc)) {
       if (!offered || offered.has(name)) models[name] = m;
     }
@@ -937,10 +977,11 @@ function buildPanel(endpoint, refreshMs, headingText, getSessionId, getTitle) {
         : name;
       tr.appendChild(slotCell(td(displayModel(name), "left", { model: true, title: priceTitle }), name));
       tr.appendChild(td(String(m.requests), "right"));
-      tr.appendChild(td(fmt(m.input), "right"));
+      const modelInput = inputBreakdown(m);
+      tr.appendChild(td(fmt(modelInput.uncached), "right", { title: modelInput.title }));
+      tr.appendChild(td(fmt(modelInput.cached), "right", { title: modelInput.title }));
       tr.appendChild(td(fmt(m.output), "right"));
       tr.appendChild(td(fmt(m.reasoning), "right"));
-      tr.appendChild(td(cachedPct(m.cachedReal, m.inputReal), "right", { title: cachedTitle(m.cachedReal, m.inputReal) }));
       tr.appendChild(td(m.avgTps ? String(m.avgTps) : "—", "right", { muted: !m.avgTps, title: tpsTitle(m) }));
       tr.appendChild(td(secs(m.ttftMs), "right", { muted: !m.ttftMs, title: ttftTitle(m) }));
       tr.appendChild(td(secs(m.avgMs), "right", { muted: !m.avgMs }));
@@ -956,10 +997,10 @@ function buildPanel(endpoint, refreshMs, headingText, getSessionId, getTitle) {
     const sumReq = rows.reduce((n, [, m]) => n + (m.requests || 0), 0);
     tr.appendChild(td("Total", "left", { strong: true, last: true }));
     tr.appendChild(td(String(sumReq), "right", { strong: true, last: true }));
-    tr.appendChild(td(fmt(w.input), "right", { strong: true, last: true }));
+    tr.appendChild(td(fmt(inputs.uncached), "right", { strong: true, last: true, title: inputs.title }));
+    tr.appendChild(td(fmt(inputs.cached), "right", { strong: true, last: true, title: inputs.title }));
     tr.appendChild(td(fmt(w.output), "right", { strong: true, last: true }));
     tr.appendChild(td(fmt(w.reasoning), "right", { strong: true, last: true }));
-    tr.appendChild(td(cachedPct(w.cachedReal, w.inputReal), "right", { strong: true, last: true, title: cachedTitle(w.cachedReal, w.inputReal) }));
     tr.appendChild(td(w.avgTps ? String(w.avgTps) : "—", "right", { strong: true, last: true, title: tpsTitle(w) }));
     tr.appendChild(td(secs(w.ttftMs), "right", { strong: true, last: true, title: ttftTitle(w) }));
     tr.appendChild(td(secs(w.avgMs), "right", { strong: true, last: true }));
@@ -969,7 +1010,8 @@ function buildPanel(endpoint, refreshMs, headingText, getSessionId, getTitle) {
 
     footer.textContent =
       `auto ${Math.round(refreshMs / 1000)}s · updated ${new Date(data.updated || Date.now()).toLocaleTimeString()}` +
-      (w.seeded ? ` · ${w.seeded} imported` : "");
+      (w.seeded ? ` · ${w.seeded} imported` : "") +
+      (inputs.unknown ? ` · ${inputs.unknown.toLocaleString()} input tokens with unknown cache status` : "");
   }
 
   const born = Date.now();
@@ -978,8 +1020,7 @@ function buildPanel(endpoint, refreshMs, headingText, getSessionId, getTitle) {
     if (!root.isConnected && Date.now() - born > 15000) { clearInterval(timer); return; }
     if (inFlight) return;
     inFlight = true;
-    refreshBtn.style.opacity = ".45";
-    refreshBtn.textContent = "…";
+    setRefreshing(true);
     try {
       const [usageRes, statusRes, keysRes] = await Promise.all([
         fetch(endpoint, { cache: "no-store" }),
@@ -1037,13 +1078,13 @@ function buildPanel(endpoint, refreshMs, headingText, getSessionId, getTitle) {
       slots = {};
     } finally {
       inFlight = false;
-      refreshBtn.style.opacity = "1";
-      refreshBtn.textContent = "↻";
+      setRefreshing(false);
     }
     paint();
   }
 
   const timer = setInterval(refresh, refreshMs);
+  onCleanup(() => { clearInterval(timer); clearTimeout(copyTimer); });
   paint();
   refresh();
   return root;
@@ -1068,27 +1109,17 @@ module.exports = {
         }
       }, 1000);
 
-      // Composer pill, the working timer: elapsed time for the routed session,
-      // plus the proxy's retry state when it is re-sending a request.
-      const tickTimer = setInterval(() => setTick((n) => n + 1), 1000);
-
       const providers = Registry.define("prism-usage.working-providers");
       ctx.add(providers, {
         id: "prism",
         show: (input) => {
-          tick();
-          const seconds = elapsedSeconds(input.session);
-          if (seconds === null) return undefined;
-          const s = proxyStatus();
-          const e = s && s.sessions && input.session ? s.sessions[input.session.id] : null;
-          const suffix = e ? ` · retrying ${e.retries} · HTTP ${e.status}` : "";
+          const retry = proxyStatus()?.sessions?.[input.session.id];
+          if (!retry) return undefined;
           return {
-            label: `Working (${formatSeconds(seconds)}${suffix})`,
+            label: "Retrying request",
             icon: "status",
-            tone: e ? "warning" : undefined,
-            title: e
-              ? `${e.model || "request"} returned ${e.status}; the proxy is retrying`
-              : "Prism is working",
+            tone: "warning",
+            title: `${retry.model || "Request"} · HTTP ${retry.status} · retry ${retry.retries}`,
           };
         },
       });
@@ -1127,7 +1158,7 @@ module.exports = {
           cached: true,
         },
         list: (input) => (input.open.includes("usage") ? [tab] : []),
-        render: () => buildPanel(endpoint, refreshMs, ctx.t("heading"), () => {
+        render: () => buildPanel(ctx.ui, endpoint, refreshMs, ctx.t("heading"), () => {
           const s = ctx.sessions && ctx.sessions.current ? ctx.sessions.current() : null;
           return s && s.id ? s.id : null;
         }, (id) => {
@@ -1157,7 +1188,6 @@ module.exports = {
 
       return () => {
         clearInterval(statusTimer);
-        clearInterval(tickTimer);
       };
     },
   }),
