@@ -50,6 +50,15 @@ const WINDOWS = ["24u", "24h", "7d", "30d", "all"];
 
 // Readable names for model ids. Unknown ids fall back to the id itself.
 const MODEL_NAMES = {
+  "claude-opus-4-5": "Claude Opus 4.5",
+  "claude-sonnet-4-6": "Claude Sonnet 4.6",
+  "claude-sonnet-5": "Claude Sonnet 5",
+  "deepseek-v4-flash": "DeepSeek V4 Flash",
+  "deepseek-v4-pro": "DeepSeek V4 Pro",
+  "grok-4.7": "Grok 4.7",
+  "Kimi-K2.6": "Kimi K2.6",
+  "Kimi-K2.7-Code": "Kimi K2.7 Code",
+  "gpt-image-2": "GPT Image 2",
   "gpt-6.2-sol": "GPT-6.2 Sol",
   "gpt-6.2-astra": "GPT-6.2 Astra",
   "gpt-6.1-sol": "GPT-6.1 Sol",

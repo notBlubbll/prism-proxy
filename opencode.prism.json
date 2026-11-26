@@ -12,6 +12,95 @@
                 "chunkTimeout": 600000
             },
             "models": {
+                "claude-opus-4-5": {
+                    "name": "Claude Opus 4.5",
+                    "package": "@opencode/ai/providers/anthropic-compatible",
+                    "cost": { "input": 5, "output": 25, "cache": { "read": 0.5, "write": 6.25 } },
+                    "capabilities": {
+                        "tools": true, "input": ["text", "image", "pdf"], "output": ["text"],
+                        "reasoning": { "supported": true, "effort": ["low", "medium", "high"] }
+                    },
+                    "limit": { "context": 200000, "output": 64000 }
+                },
+                "claude-sonnet-4-6": {
+                    "name": "Claude Sonnet 4.6",
+                    "package": "@opencode/ai/providers/anthropic-compatible",
+                    "cost": { "input": 3, "output": 15, "cache": { "read": 0.3, "write": 3.75 } },
+                    "capabilities": {
+                        "tools": true, "input": ["text", "image", "pdf"], "output": ["text"],
+                        "reasoning": { "supported": true, "effort": ["low", "medium", "high", "max"] }
+                    },
+                    "limit": { "context": 1000000, "output": 128000 }
+                },
+                "claude-sonnet-5": {
+                    "name": "Claude Sonnet 5",
+                    "package": "@opencode/ai/providers/anthropic-compatible",
+                    "cost": { "input": 2, "output": 10, "cache": { "read": 0.2, "write": 2.5 } },
+                    "capabilities": {
+                        "tools": true, "input": ["text", "image", "pdf"], "output": ["text"],
+                        "reasoning": { "supported": true, "effort": ["low", "medium", "high", "xhigh", "max"] }
+                    },
+                    "limit": { "context": 1000000, "output": 128000 }
+                },
+                "deepseek-v4-flash": {
+                    "name": "DeepSeek V4 Flash",
+                    "package": "@opencode/ai/providers/openai-compatible",
+                    "cost": { "input": 0.14, "output": 0.28, "cache": { "read": 0.028 } },
+                    "capabilities": {
+                        "tools": true, "input": ["text"], "output": ["text"],
+                        "reasoning": { "supported": true, "effort": ["low", "high", "max"] }
+                    },
+                    "compatibility": { "reasoningField": "reasoning_content", "maxTokensField": "max_tokens" },
+                    "limit": { "context": 1000000, "output": 384000 }
+                },
+                "deepseek-v4-pro": {
+                    "name": "DeepSeek V4 Pro",
+                    "package": "@opencode/ai/providers/openai-compatible",
+                    "cost": { "input": 1.74, "output": 3.48, "cache": { "read": 0.145 } },
+                    "capabilities": {
+                        "tools": true, "input": ["text"], "output": ["text"],
+                        "reasoning": { "supported": true, "effort": ["high", "max"] }
+                    },
+                    "compatibility": { "reasoningField": "reasoning_content", "maxTokensField": "max_tokens" },
+                    "limit": { "context": 1000000, "output": 384000 }
+                },
+                "grok-4.7": {
+                    "name": "Grok 4.7",
+                    "package": "@opencode/ai/providers/openai-compatible",
+                    "cost": [
+                        { "input": 2, "output": 6, "cache": { "read": 0.5 } },
+                        { "tier": { "type": "context", "size": 200000 }, "input": 4, "output": 12, "cache": { "read": 1 } }
+                    ],
+                    "capabilities": {
+                        "tools": true, "input": ["text", "image"], "output": ["text"],
+                        "reasoning": { "supported": true, "effort": ["low", "medium", "high", "xhigh"] }
+                    },
+                    "limit": { "context": 500000, "output": 500000 }
+                },
+                "Kimi-K2.6": {
+                    "name": "Kimi K2.6",
+                    "package": "@opencode/ai/providers/openai-compatible",
+                    "cost": { "input": 0.95, "output": 4, "cache": { "read": 0.16 } },
+                    "capabilities": { "tools": true, "input": ["text", "image"], "output": ["text"], "reasoning": { "supported": true } },
+                    "compatibility": { "reasoningField": "reasoning_content", "maxTokensField": "max_tokens" },
+                    "limit": { "context": 262144, "output": 65536 }
+                },
+                "Kimi-K2.7-Code": {
+                    "name": "Kimi K2.7 Code",
+                    "package": "@opencode/ai/providers/openai-compatible",
+                    "cost": { "input": 0.95, "output": 4, "cache": { "read": 0.19 } },
+                    "capabilities": { "tools": true, "input": ["text", "image"], "output": ["text"], "reasoning": { "supported": true } },
+                    "compatibility": { "reasoningField": "reasoning_content", "maxTokensField": "max_tokens" },
+                    "limit": { "context": 262144, "output": 262144 }
+                },
+                "gpt-image-2": {
+                    "name": "GPT Image 2",
+                    "type": "image",
+                    "package": "@opencode/ai/providers/openai/images",
+                    "cost": { "input": 5, "output": 30, "cache": { "read": 1.25 } },
+                    "capabilities": { "tools": false, "input": ["text", "image"], "output": ["image"] },
+                    "limit": { "context": 0, "output": 0 }
+                },
                 "gpt-6.2-sol": {
                     "name": "GPT-6.2 Sol",
                     "cost": [

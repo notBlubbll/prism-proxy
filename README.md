@@ -1,7 +1,7 @@
 # prism-proxy
 
 An OpenCode V2 plugin and standalone daemon for the PrismRouter
-(`claude.c00l.site`) doway endpoint. It adds a **global 30 requests/minute** and
+(`claude.c00l.site`) Doway and root endpoints. It adds a **global 30 requests/minute** and
 **10M tokens/minute** sliding window per key, so OpenCode's fan-out (subagents,
 retries, parallel tool calls) queues instead of hitting the gateway's `429`.
 It also owns the credentials through a small key pool.
@@ -25,9 +25,11 @@ waits for room, and forwards only when the budget allows it.
 
 The windows are global across models. Per-model limits are available with
 `PRISM_PROXY_LIMITS` and `PRISM_PROXY_TOKEN_LIMITS` (format `model=30/60s`).
-Token use is estimated from the prompt size and reconciled from the upstream
-`usage` once the response completes. A prompt larger than the whole budget is
-clamped and queued, never rejected.
+Each attempt reserves the estimated input plus the requested output budget.
+Reported usage can increase that reservation. If PrismRouter sends a key-wide
+429, the proxy pauses new requests on that key for the advertised delay and
+retries the rejected request. Rejected attempts count toward RPM but release
+their token reservation.
 
 ## Install
 
@@ -38,20 +40,25 @@ cp keys.json.example keys.json   # then paste the key
 node index.js                    # or: bun index.js
 ```
 
-`keys.json` is git-ignored. The proxy listens on `127.0.0.1:17334` and forwards
-to `https://claude.c00l.site/doway/v1`.
+`keys.json` is git-ignored. Send bare, case-sensitive model IDs to
+`http://127.0.0.1:17334/v1`. The proxy sends GPT chat models to `/doway/v1`
+and the following IDs to `/v1` on the same PrismRouter host:
 
-The doway route expects **bare model ids** (`gpt-6.2-sol`, not
-`doway/gpt-6.2-sol`). The root `/v1` route on the same host rejects this key
-with `403 This API key is not allowed to use the root provider`; `/doway/v1`
-is the route that works.
+| Local endpoint | Root model IDs |
+| --- | --- |
+| `/v1/messages` | `claude-opus-4-5`, `claude-sonnet-4-6`, `claude-sonnet-5` |
+| `/v1/chat/completions` | `deepseek-v4-flash`, `deepseek-v4-pro`, `Kimi-K2.6`, `Kimi-K2.7-Code`, `grok-4.7` |
+| `/v1/images/generations`, `/v1/images/edits` | `gpt-image-2` |
+
+`GET /v1/models` also includes these root IDs when the key's root catalog lists
+them. The panel's default ping list remains Doway-only.
 
 ## OpenCode
 
 Copy [`opencode.prism.json`](./opencode.prism.json) into your OpenCode config,
 or merge its `providers.prism` block. It points at
-`http://127.0.0.1:17334/v1` and includes 20 chat models with models.dev pricing,
-context limits and reasoning variants.
+`http://127.0.0.1:17334/v1` and includes 28 chat models and one image model.
+Use `prism/gpt-image-2` for image generation; it is not a session chat model.
 
 The provider's `apiKey` is `{env:PRISM_API_KEY}`. With a key in `keys.json` the
 proxy replaces whatever the client sends, so the env var only needs to be
@@ -63,8 +70,8 @@ non-empty. Set it in the OpenCode server environment:
 
 Or put the real key there and leave `keys.json` empty.
 
-The provider uses `@opencode-ai/ai/providers/openai-compatible/responses`, so
-OpenCode calls `/v1/responses`. That matters for the GPT-6.x models: the chat
+The provider defaults to the Responses API for Doway; root models select their
+own runtime. That matters for the GPT-6.x models: the chat
 completions endpoint rejects function tools combined with reasoning
 (`Function tools with reasoning_effort are not supported ...`), while the
 Responses API accepts them. Responses-only models (`gpt-5*-codex`,
@@ -101,7 +108,8 @@ full key to a loopback client only.
 `/usage` reports requests, input/output/cached/reasoning tokens, estimated USD
 cost, time-to-first-token and decode speed per model. Prices come from
 [models.dev](https://models.dev) (the `opencode` table, falling back to
-`openai`), including the 272K-context tier. Override any model with:
+`openai`), including model-specific context tiers. Claude cache reads and writes
+and GPT Image 2 image-input tokens use their own rates when reported. Override a model's flat rates with:
 
 ```sh
 PRISM_PROXY_PRICING="gpt-6.2-sol=2/10/0.1"

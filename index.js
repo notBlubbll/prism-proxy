@@ -1,5 +1,5 @@
 // prism-proxy/index.js - OpenCode V2 plugin: local OpenAI-compatible proxy
-// for the PrismRouter (c00l.site) doway endpoint.
+// for the PrismRouter (c00l.site) Doway and root endpoints.
 //
 // It does two things:
 //   1. GLOBAL RATE LIMITING - PrismRouter caps the whole key at 30 requests
@@ -19,6 +19,7 @@
 
 import { createServer, request as httpRequest } from "node:http";
 import { request as httpsRequest } from "node:https";
+import { createInterface } from "node:readline";
 import { createHash } from "node:crypto";
 import zlib from "node:zlib";
 import fs from "node:fs";
@@ -51,6 +52,8 @@ const UPSTREAM = (() => {
   try { return new URL(process.env.PRISM_PROXY_UPSTREAM || UPSTREAM_DEFAULT); }
   catch { return new URL(UPSTREAM_DEFAULT); }
 })();
+const UPSTREAM_PATH = UPSTREAM.pathname.replace(/\/$/, "");
+const ROOT_PATH = UPSTREAM_PATH.replace(/\/doway\/v1$/, "/v1");
 
 // ---- rate limits -----------------------------------------------------------
 // PrismRouter caps the whole key, not each model: 30 requests per minute. Every
@@ -62,6 +65,12 @@ const LIMITS_DEFAULT = "";
 const TOKEN_LIMITS_DEFAULT = "";
 const GLOBAL_LIMITS_DEFAULT = "global=30/60s";
 const GLOBAL_TOKEN_LIMITS_DEFAULT = "global=10000000/60s";
+const ROOT_MODELS = new Map([
+  ["claude-opus-4-5", "/messages"], ["claude-sonnet-4-6", "/messages"], ["claude-sonnet-5", "/messages"],
+  ["deepseek-v4-flash", "/chat/completions"], ["deepseek-v4-pro", "/chat/completions"],
+  ["Kimi-K2.6", "/chat/completions"], ["Kimi-K2.7-Code", "/chat/completions"],
+  ["grok-4.7", "/chat/completions"], ["gpt-image-2", "/images/generations"],
+]);
 // Models the panel's "Ping models" button checks when the request names none.
 const PING_MODELS_DEFAULT = [
   "gpt-6.2-sol", "gpt-6.2-astra", "gpt-6.1-sol", "gpt-6.1-terra",
@@ -72,10 +81,17 @@ const PING_MODELS_DEFAULT = [
 ];
 
 // USD per 1M tokens from models.dev (provider `opencode`, falling back to
-// `openai` for models OpenCode does not list). Cache writes are not reported by
-// this gateway, so only input, output and cached-read are billed. Override with
-// PRISM_PROXY_PRICING="model=in/out/cached,...".
+// `openai` for models OpenCode does not list), overridable with PRISM_PROXY_PRICING.
 const PRICING_DEFAULT = {
+  "claude-opus-4-5": { in: 5, out: 25, cached: 0.5, write: 6.25 },
+  "claude-sonnet-4-6": { in: 3, out: 15, cached: 0.3, write: 3.75 },
+  "claude-sonnet-5": { in: 2, out: 10, cached: 0.2, write: 2.5 },
+  "deepseek-v4-flash": { in: 0.14, out: 0.28, cached: 0.028 },
+  "deepseek-v4-pro": { in: 1.74, out: 3.48, cached: 0.145 },
+  "Kimi-K2.6": { in: 0.95, out: 4, cached: 0.16 },
+  "Kimi-K2.7-Code": { in: 0.95, out: 4, cached: 0.19 },
+  "grok-4.7": { in: 2, out: 6, cached: 0.5 },
+  "gpt-image-2": { in: 5, out: 30, cached: 1.25, imageInput: 8, imageCached: 2 },
   "gpt-4.1": { in: 2, out: 8, cached: 0.5 },
   "gpt-4.1-mini": { in: 0.4, out: 1.6, cached: 0.1 },
   "gpt-4.1-nano": { in: 0.1, out: 0.4, cached: 0.025 },
@@ -132,9 +148,9 @@ function parsePricing(src) {
 
 const PRICING = { ...PRICING_DEFAULT, ...parsePricing(process.env.PRISM_PROXY_PRICING || "") };
 
-// Models that charge more once the prompt passes 272K input tokens. Keyed by
-// the base model id, with the rates for the larger tier.
+// Rates above each model's input-token threshold.
 const PRICING_TIERS = {
+  "grok-4.7": { over: 200000, in: 4, out: 12, cached: 1 },
   "gpt-5.4": { over: 272000, in: 5, out: 22.5, cached: 0.5 },
   "gpt-5.4-pro": { over: 272000, in: 60, out: 270, cached: 60 },
   "gpt-5.5": { over: 272000, in: 10, out: 45, cached: 1 },
@@ -173,7 +189,13 @@ function recordCost(r) {
   if (tier && !r.seed && (r.i || 0) > tier.over) p = tier;
   const cached = Math.min(r.c || 0, r.i || 0);
   const fresh = Math.max(0, (r.i || 0) - cached);
-  return (fresh * p.in + cached * p.cached + (r.o || 0) * p.out) / 1e6;
+  let cost = fresh * p.in + cached * p.cached + (r.o || 0) * p.out;
+  if (p.write) cost += (r.cacheWrite || 0) * (p.write - p.in) + (r.hourWrite || 0) * (2 * p.in - p.write);
+  if (p.imageInput) {
+    const cachedImage = r.cachedImage || 0;
+    cost += ((r.imageInput || 0) - cachedImage) * (p.imageInput - p.in) + cachedImage * (p.imageCached - p.cached);
+  }
+  return cost / 1e6;
 }
 
 // Retries after an upstream 429 before the 429 is handed to the client.
@@ -274,10 +296,10 @@ function appendUsageRecord(rec) {
 //   gm   - first -> last text frame (the generation window). Zero when there were
 //          fewer than two text frames, which leaves the request out of tok/s.
 //   ms   - total wall time, kept for latency only.
-function recordUsage(model, result, ms, slot = 0) {
+function recordUsage(model, result, ms, slot = 0, imageRequest = false) {
   if (!model || !result || result.status !== 200) return;
-  const u = parseUsageFromText(result.tail);
-  if (!u) return;
+  const u = result.usage ?? parseUsageFromText(result.tail);
+  if (!u && !imageRequest) return;
   const t = result.timing || {};
   const ttft = t.firstTokenAt && t.sentAt ? Math.max(0, t.firstTokenAt - t.sentAt) : 0;
   const gm = t.firstTokenAt && t.lastTokenAt && t.tokenFrames >= 2
@@ -287,15 +309,53 @@ function recordUsage(model, result, ms, slot = 0) {
     t: Date.now(),
     m: model,
     k: slot,
-    i: u.prompt,
-    o: u.completion,
-    r: u.reasoning,
-    c: u.cached,
+    i: u?.prompt ?? 0,
+    o: u?.completion ?? 0,
+    r: u?.reasoning ?? 0,
+    c: u?.cached ?? 0,
+    ...u?.details,
     gm,
     ttft,
     sr: t.sawReasoning ? 1 : 0,
     ms: Math.max(0, Math.round(ms)),
   });
+  return u && u.prompt + u.completion;
+}
+
+function nativeUsage(u, messages) {
+  if (!u || (u.input_tokens == null && u.output_tokens == null)) return null;
+  if (messages) {
+    const cached = u.cache_read_input_tokens ?? 0;
+    const cacheWrite = u.cache_creation_input_tokens ?? 0;
+    return { prompt: (u.input_tokens ?? 0) + cached + cacheWrite, completion: u.output_tokens ?? 0, cached,
+      details: { cacheWrite, hourWrite: u.cache_creation?.ephemeral_1h_input_tokens ?? 0 } };
+  }
+  const input = u.input_tokens_details ?? {};
+  return { prompt: u.input_tokens ?? 0, completion: u.output_tokens ?? 0, cached: input.cached_tokens ?? 0,
+    details: { imageInput: input.image_tokens ?? 0, cachedImage: input.cached_tokens_details?.image_tokens ?? 0 } };
+}
+
+function captureNativeUsage(stream, isEventStream, messages) {
+  let usage;
+  const collect = (text) => {
+    try {
+      const event = JSON.parse(text);
+      const counts = event.type === "message_start" ? event.message?.usage : event.usage;
+      if (counts) usage = { ...usage, ...Object.fromEntries(Object.entries(counts).filter(([, value]) => value != null)) };
+    } catch {}
+  };
+  if (isEventStream) {
+    const lines = createInterface({ input: stream, crlfDelay: Infinity });
+    lines.on("line", (line) => {
+      if (line.startsWith("data:") && line.includes('"usage"')) collect(line.slice(5));
+    });
+    lines.on("error", () => lines.close());
+  } else {
+    const chunks = [];
+    stream.on("data", (chunk) => chunks.push(chunk));
+    stream.on("end", () => collect(Buffer.concat(chunks).toString("utf8")));
+  }
+  return () => nativeUsage(usage, messages);
 }
 
 function parseUsageFromText(text) {
@@ -573,8 +633,8 @@ class ModelLimiter {
 
   // Replace a reservation's estimate with what the request actually used.
   reconcile(entry, actualTokens) {
-    if (!entry || !Number.isFinite(actualTokens) || actualTokens <= 0) return;
-    entry.n = Math.max(1, Math.round(actualTokens));
+    if (!entry || !Number.isFinite(actualTokens) || actualTokens < 0) return;
+    entry.n = Math.round(actualTokens);
   }
 
   blockFor(ms, now) {
@@ -1032,6 +1092,8 @@ let lastAuthHeader = null; // most recent gateway credential seen on a real requ
 
 async function pingModel(model, auth, pingSlot = 0) {
   const started = Date.now();
+  const endpoint = ROOT_MODELS.get(model) ?? "/chat/completions";
+  if (endpoint === "/images/generations") return { model, ok: false, skipped: true, ms: 0, error: "Image model; no chat ping" };
   // Include the reply budget so the token reservation cannot push a window over
   // its cap: the limiter sees prompt + max_tokens up front.
   const estTokens = Math.ceil((PING_PROMPT.length + 64) / 4) + 60;
@@ -1054,18 +1116,19 @@ async function pingModel(model, auth, pingSlot = 0) {
 
   try {
     const payload = { model, stream: false, max_tokens: 60, messages: [{ role: "user", content: PING_PROMPT }] };
-    const res = await postJson("/chat/completions", { "content-type": "application/json", ...(auth ? { authorization: auth } : {}) }, payload, Math.max(1000, PING_TIMEOUT_MS - queueMs));
+    const headers = { "content-type": "application/json", ...(auth ? { authorization: auth } : {}) };
+    if (endpoint === "/messages") headers["anthropic-version"] = "2023-06-01";
+    const res = await postJson(endpoint, headers, payload, Math.max(1000, PING_TIMEOUT_MS - queueMs));
     const ms = Date.now() - started;
     if (res.status >= 400) {
       return { model, ok: false, queueMs, ms, error: `HTTP ${res.status}: ${res.text.replace(/\s+/g, " ").slice(0, 140)}` };
     }
     const j = JSON.parse(res.text);
-    const text = (j?.choices?.[0]?.message?.content || "").trim();
-    const u = parseUsageFromText(res.text);
-    // A non-streaming reply has no first-token time, so it carries no gm/ttft and
-    // stays out of tok/s; it still counts toward requests and tokens.
-    if (u) appendUsageRecord({ t: Date.now(), m: model, i: u.prompt, o: u.completion, r: u.reasoning, c: u.cached, ms: Math.max(0, ms - queueMs) });
-    reconcileTokens(reservation, estTokens, Buffer.byteLength(res.text));
+    const messages = endpoint === "/messages";
+    const text = messages ? (j.content || []).filter((part) => part.type === "text").map((part) => part.text).join("").trim()
+      : (j?.choices?.[0]?.message?.content || "").trim();
+    const tokens = recordUsage(model, { status: res.status, tail: res.text, usage: messages ? nativeUsage(j.usage, true) : null }, ms - queueMs, slot);
+    reconcileTokens(reservation, tokens ?? estTokens, tokens == null ? Buffer.byteLength(res.text) : 0);
     return { model, ok: true, queueMs, ms, text };
   } catch (e) {
     return { model, ok: false, queueMs, ms: Date.now() - started, error: String(e?.message || e) };
@@ -1338,16 +1401,34 @@ function upstreamRequest(target, opts) {
   });
 }
 
-function targetUrl(urlPath) {
-  const base = UPSTREAM.pathname.replace(/\/$/, "");
+function targetUrl(urlPath, model) {
+  const base = ROOT_MODELS.has(model) ? ROOT_PATH : UPSTREAM_PATH;
   const suffix = urlPath.replace(/^\/v1(?=\/)/, "");
   return new URL(base + suffix, UPSTREAM);
+}
+
+async function appendRootModels(raw, headers, search) {
+  try {
+    const catalog = JSON.parse(raw);
+    const url = new URL(`${ROOT_PATH}/models${search}`, UPSTREAM);
+    const response = await fetch(url, { headers, redirect: "error", signal: AbortSignal.timeout(5000) });
+    if (!response.ok) { await response.body?.cancel(); return raw; }
+    const root = await response.json();
+    const seen = new Set(catalog.data.map((entry) => entry.id));
+    for (const entry of root.data) {
+      if (ROOT_MODELS.has(entry.id) && !seen.has(entry.id)) {
+        catalog.data.push(entry);
+        seen.add(entry.id);
+      }
+    }
+    return JSON.stringify(catalog);
+  } catch { return raw; }
 }
 
 function postJson(urlPath, headers, payload, timeoutMs = 180000) {
   return new Promise((resolve, reject) => {
     const body = Buffer.from(JSON.stringify(payload), "utf8");
-    const req = upstreamRequest(targetUrl(urlPath), {
+    const req = upstreamRequest(targetUrl(urlPath, payload.model), {
       method: "POST",
       headers: { ...headers, "content-length": String(body.length) },
     });
@@ -1409,7 +1490,8 @@ function parseRetryAfterMs(headers) {
 // Learn the limit from the gateway's own error text, e.g.
 //   "gpt-6.2-astra request limit reached (30 requests per minute). Try again in 29s."
 const LIMIT_RE = /\((\d+)\s+requests?\s+per\s+(minute|hour)\)/i;
-const RETRY_HINT_RE = /try again in\s+(\d+)\s*(s|sec|ms)/i;
+const RETRY_HINT_RE = /\b(?:try again|retry) in\s+(\d+(?:\.\d+)?)\s*(ms|milliseconds?|seconds?|secs?|s)\b/i;
+const KEY_LIMIT_RE = /\b(?:tokens?|requests?)\s+per\s+(?:minute|hour)\s+for\s+this\s+API\s+key\b/i;
 
 function learnFrom429(model, headers, text, slot = 0) {
   let retryMs = parseRetryAfterMs(headers);
@@ -1421,10 +1503,10 @@ function learnFrom429(model, headers, text, slot = 0) {
   }
   if (retryMs == null) {
     const h = RETRY_HINT_RE.exec(text || "");
-    if (h) retryMs = Number(h[1]) * (h[2].toLowerCase() === "ms" ? 1 : 1000);
+    if (h) retryMs = Number(h[1]) * (/^m/i.test(h[2]) ? 1 : 1000);
   }
   if (retryMs == null) retryMs = 15000;
-  retryMs = Math.min(retryMs, RETRY_AFTER_CAP_MS);
+  retryMs = Math.max(0, Math.min(retryMs, RETRY_AFTER_CAP_MS));
 
   // Only the session's own key slot is blocked: a 429 on key 1 must not stall
   // a session pinned to key 2.
@@ -1439,11 +1521,13 @@ function learnFrom429(model, headers, text, slot = 0) {
       lim.windowMs = discovered.windowMs;
     }
   }
+  const keyWide = KEY_LIMIT_RE.test(text || "") || !discovered;
+  if (keyWide) lim = globalLimiterFor(slot) || lim;
   if (lim) {
     lim.blockFor(retryMs, Date.now());
     lim.retries++;
   }
-  return { limiter: lim, retryMs };
+  return { limiter: lim, retryMs, keyWide };
 }
 
 function readRequest(body) {
@@ -1665,12 +1749,23 @@ async function handle(req, res) {
   let model = meta.model;
   const isChat = url.pathname.includes("/chat/completions");
   const isResponses = req.method === "POST" && /^\/(?:v1\/)?responses\/?$/.test(url.pathname);
+  const isMessages = req.method === "POST" && /^\/(?:v1\/)?messages\/?$/.test(url.pathname);
+  const isImage = req.method === "POST" && /^\/(?:v1\/)?images\/(generations|edits)\/?$/.test(url.pathname);
+  const contentType = req.headers["content-type"] || "";
+  if (isImage && /^multipart\/form-data\b/i.test(contentType)) {
+    try {
+      const form = await new Response(body, { headers: { "content-type": contentType } }).formData();
+      const field = form.get("model");
+      model = typeof field === "string" ? field : null;
+    } catch { return sendJson(res, 400, '{"error":{"message":"Invalid multipart image request"}}'); }
+  }
   const sessionId = req.headers["x-opencode-session-id"] || req.headers["x-opencode-session"] || null;
   // With a key pool configured, this request goes out on the key its session is
   // pinned to, and follows that key's windows rather than the shared ones.
   const keySlot = keySlotForSession(sessionId);
   if (keySlot >= 1 && keySlot <= keyPool.length) {
     req.headers.authorization = `Bearer ${keyPool[keySlot - 1]}`;
+    if (req.headers["x-api-key"]) req.headers["x-api-key"] = keyPool[keySlot - 1];
   }
   const started = Date.now();
 
@@ -1713,7 +1808,7 @@ async function handle(req, res) {
       model = meta.model || model;
     }
 
-    let estTokens = estimateTokens(body);
+    let estTokens = estimateTokens(body, meta.maxTokens);
     let reservation = null;
     let spilledFrom = null;
 
@@ -1728,7 +1823,7 @@ async function handle(req, res) {
       overflowStats.set(model, stat);
       log(`overflow ${model} -> ${rule.to} (${why})`);
       body = rewriteModel(body, rule.to);
-      estTokens = estimateTokens(body);
+      estTokens = estimateTokens(body, meta.maxTokens);
       const from = model;
       model = rule.to;
       spill = { target: rule.to, from };
@@ -1743,8 +1838,9 @@ async function handle(req, res) {
     const reqJson = isChat && VISION_ENABLED ? readRequest(body).json : null;
     let imageFallback = !!reqJson && model !== VISION_MODEL && collectImageParts(reqJson).length > 0;
 
-    const maxAttempts = MAX_429_RETRIES + 2;
+    const maxAttempts = 1 + MAX_429_RETRIES + MAX_5XX_RETRIES + Number(imageFallback);
     let serverAttempts = 0;
+    let rateAttempts = 0;
     const budgetStart = Date.now();
     const reserveAttempt = async (maxWaitMs) => {
       PROXY_STATE.queued++;
@@ -1752,7 +1848,7 @@ async function handle(req, res) {
     };
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       if (res.destroyed || res.writableEnded) return;
-      if ((isChat || isResponses) && model && hasLimiter(model, keySlot)) {
+      if ((isChat || isResponses || isMessages || isImage) && model && hasLimiter(model, keySlot)) {
         const rule = !spilledFrom && OVERFLOW.get(model);
         reservation = await reserveAttempt(rule ? rule.maxWaitMs : 0);
         if (reservation?.spill) {
@@ -1765,23 +1861,22 @@ async function handle(req, res) {
       const result = await forward(req, res, url, body, model, isChat, {
         headers: spilledFrom ? { "x-prism-overflow": `${spilledFrom}->${model}` } : {},
         imageFallback,
-        retry5xx: isChat || isResponses,
+        retry5xx: isChat || isResponses || isMessages,
+        isMessages, isImage,
+        retry429: !!model && (isChat || isResponses || isMessages || isImage),
       });
       if (result.done) {
-        reconcileTokens(reservation, estTokens, result.bytes);
-        recordUsage(model, result, Date.now() - started, keySlot);
-        // Image generation replies carry no token usage: count the request so the
-        // model shows up in the usage table.
-        if (model && result.status === 200 && url.pathname.includes("/images/generations")) {
-          appendUsageRecord({ t: Date.now(), m: model, k: keySlot, i: 0, o: 0, r: 0, c: 0, gm: 0, ttft: 0, sr: 0, ms: Math.max(0, Math.round(Date.now() - started)) });
-        }
+        const tokens = recordUsage(model, result, Date.now() - started, keySlot, isImage);
+        const measured = tokens ?? estTokens + Math.ceil((isImage ? 0 : result.bytes || 0) / 4);
+        // The gateway can meter the admission estimate even when the reply uses fewer tokens.
+        reconcileTokens(reservation, Math.max(estTokens, measured), 0);
         return;
       }
       if (result.visionFallback) {
         imageFallback = false;
         log(`upstream rejected an image request for ${model} (400); retrying with captions :: ${String(result.text).replace(/\s+/g, " ").slice(0, 160)}`);
         body = await visionHandoff(body, model, req.headers.authorization, true, keySlot);
-        estTokens = estimateTokens(body);
+        estTokens = estimateTokens(body, meta.maxTokens);
         continue;
       }
       if (result.serverError) {
@@ -1804,14 +1899,17 @@ async function handle(req, res) {
         await sleep(wait);
         continue;
       }
-      if (attempt === maxAttempts || Date.now() - budgetStart > RATE_LIMIT_BUDGET_MS) {
+      const { retryMs, keyWide } = learnFrom429(model, result.headers, result.text, keySlot);
+      reconcileTokens(reservation, 0, 0);
+      if (++rateAttempts > MAX_429_RETRIES || attempt === maxAttempts || Date.now() - budgetStart + retryMs > RATE_LIMIT_BUDGET_MS) {
         log(`429 budget exhausted for ${model}, forwarding the 429`);
-        return sendJson(res, result.status, result.text);
+        const retryAfter = result.headers["retry-after"] || String(Math.ceil(retryMs / 1000));
+        return sendJson(res, result.status, result.text, { "retry-after": retryAfter });
       }
-      const { retryMs } = learnFrom429(model, result.headers, result.text, keySlot);
       PROXY_STATE.retries++;
+      noteSessionRetry(sessionId, result.status, model);
       const rule = OVERFLOW.get(model);
-      if (rule && !spilledFrom && retryMs > rule.maxWaitMs) {
+      if (!keyWide && rule && !spilledFrom && retryMs > rule.maxWaitMs) {
         spillOver(`upstream 429, retry in ${Math.round(retryMs / 1000)}s`);
         continue;
       }
@@ -1849,7 +1947,7 @@ function forward(req, res, url, body, model, isChat, opts = {}) {
 
     let up;
     try {
-      up = upstreamRequest(targetUrl(url.pathname + url.search), { method: req.method, headers });
+      up = upstreamRequest(targetUrl(url.pathname + url.search, model), { method: req.method, headers });
     } catch (err) {
       log(`upstream request failed: ${err?.message || err}`);
       send(res, 502, "text/plain", `prism-proxy: ${err?.message || err}\n`);
@@ -1872,6 +1970,12 @@ function forward(req, res, url, body, model, isChat, opts = {}) {
       const dec = decoderFor(rawRes.headers["content-encoding"]);
       const upRes = dec ? rawRes.pipe(dec) : rawRes;
       if (dec) rawRes.on("error", (e) => dec.destroy(e));
+      const eventStream = String(rawRes.headers["content-type"] || "").includes("event-stream");
+      const sse = isChat && status === 200 && eventStream;
+      let held = null;
+      let holdDone = false;
+      const readUsage = status === 200 && (opts.isMessages || opts.isImage)
+        ? captureNativeUsage(upRes, eventStream, opts.isMessages) : null;
       upRes.on("data", (c) => {
         respBytes += c.length;
         if (!firstByteAt) firstByteAt = Date.now();
@@ -1917,15 +2021,23 @@ function forward(req, res, url, body, model, isChat, opts = {}) {
       delete hdrs.connection;
       if (dec) delete hdrs["content-encoding"]; // the bytes below are already decoded
 
+      if (status === 200 && req.method === "GET" && /^\/(?:v1\/)?models\/?$/.test(url.pathname) && ROOT_PATH !== UPSTREAM_PATH) {
+        const auth = {};
+        for (const name of ["authorization", "x-api-key"]) if (headers[name]) auth[name] = headers[name];
+        delete hdrs.etag;
+        readBody(upRes).then((raw) => appendRootModels(raw, auth, url.search)).then((catalog) => {
+          res.writeHead(status, hdrs);
+          res.end(catalog);
+          finish({ done: true });
+        }).catch(() => { sendJson(res, 502, '{"error":{"message":"Failed to read upstream model catalog"}}'); finish({ done: true }); });
+        return;
+      }
+
       // A 200 SSE stream can still carry an error frame as its first data line
       // (e.g. `data: {"error":{"code":"upstream_rejected_request",...}}`): the
       // provider failed after the HTTP status was already 200. Buffer the first
       // chunk and check before anything reaches the client, so the turn can be
       // retried instead of failing with "Provider returned error".
-      const sse = isChat && status === 200 && String(hdrs["content-type"] || "").includes("event-stream");
-      let held = null; // first chunk, kept until we know it is not an error
-      let holdDone = false; // held chunk released to the client (or consumed)
-
       const releaseHeld = () => {
         if (holdDone || held === null) return;
         holdDone = true;
@@ -1940,14 +2052,15 @@ function forward(req, res, url, body, model, isChat, opts = {}) {
         // attributable instead of an opaque "blocked by the provider".
         const ct = String(hdrs["content-type"] || "");
         const retryable = opts.retry5xx && (isChat ? status >= 500 : [502, 503, 504, 520, 522, 524].includes(status));
-        if (retryable || !ct.includes("event-stream")) {
+        const throttled = status === 429 && opts.retry429;
+        if (throttled || retryable || !ct.includes("event-stream")) {
           const chunks = [];
           let size = 0;
           upRes.on("data", (c) => { if (size < 65536) { chunks.push(c); size += c.length; } });
           upRes.on("end", () => {
             const text = Buffer.concat(chunks).toString("utf8");
             log(`res ${status} model=${model || "-"} :: ${text.replace(/\s+/g, " ").slice(0, 400)}`);
-            if (status === 429 && isChat && model) return finish({ retry: true, status, headers: rawRes.headers, text });
+            if (throttled) return finish({ retry: true, status, headers: rawRes.headers, text });
             // Transient 5xx: let the caller retry the same body.
             if (retryable) {
               return finish({ serverError: true, status, headers: rawRes.headers, text });
@@ -1961,7 +2074,7 @@ function forward(req, res, url, body, model, isChat, opts = {}) {
           });
           upRes.on("error", () => {
             if (retryable) return finish({ serverError: true, status, headers: rawRes.headers, text: "" });
-            if (status === 429 && isChat && model) return finish({ retry: true, status, headers: upRes.headers, text: "" });
+            if (throttled) return finish({ retry: true, status, headers: upRes.headers, text: "" });
             try { res.end(); } catch {}
             finish({ done: true });
           });
@@ -1977,8 +2090,8 @@ function forward(req, res, url, body, model, isChat, opts = {}) {
       } else {
         res.writeHead(status, hdrs);
         upRes.pipe(res);
-        upRes.on("end", () => finish({ done: true, status, bytes: respBytes, tail, timing: timing2() }));
-        upRes.on("error", () => { try { res.end(); } catch {} finish({ done: true, status, bytes: respBytes, tail, timing: timing2() }); });
+        upRes.on("end", () => finish({ done: true, status, bytes: respBytes, tail, usage: readUsage?.(), timing: timing2() }));
+        upRes.on("error", () => { try { res.end(); } catch {} finish({ done: true, status, bytes: respBytes, tail, usage: readUsage?.(), timing: timing2() }); });
       }
     });
 
@@ -2006,10 +2119,11 @@ function reconcileTokens(reservation, estTokens, respBytes) {
 
 // Rough prompt size, with inline data URLs collapsed so a screenshot is not
 // counted as hundreds of thousands of text tokens before it reaches upstream.
-function estimateTokens(body) {
+function estimateTokens(body, maxOutput) {
   let text = body.toString("utf8");
   if (text.includes("data:")) text = text.replace(/data:[^"\\]+/g, "data:image");
-  return Math.ceil(text.length / 4);
+  const outputBudget = Number.isSafeInteger(maxOutput) && maxOutput > 0 ? maxOutput : 0;
+  return Math.ceil(text.length / 4) + outputBudget;
 }
 
 // Wait until no other request is in flight. The compaction request is the one
@@ -2166,7 +2280,7 @@ function forwardBuffered(req, url, body, model) {
     const headers = buildForwardHeaders(req.headers, body.length);
     let up;
     try {
-      up = upstreamRequest(targetUrl(url.pathname + url.search), { method: req.method, headers });
+      up = upstreamRequest(targetUrl(url.pathname + url.search, model), { method: req.method, headers });
     } catch (err) {
       return resolve({ status: 502, headers: {}, text: `prism-proxy: ${err?.message || err}`, finish: null });
     }
@@ -2246,44 +2360,50 @@ async function runCompaction(req, res, url, body, model, slot = 0) {
       estTokens = estimateTokens(body);
     }
   }
-  let reservation = null;
-  if (hasLimiter(model, slot)) {
-    PROXY_STATE.queued++;
-    try { reservation = await acquire(model, estTokens, 0, slot); } finally { PROXY_STATE.queued--; }
-  }
-  const settle = (r) => reconcileTokens(reservation, estTokens, usageTokens(r.text) || r.text.length);
+  estTokens = estimateTokens(body, readRequest(body).maxTokens);
+  const sessionId = req.headers["x-opencode-session-id"] || req.headers["x-opencode-session"];
 
   const budgetStart = Date.now();
   for (let attempt = 1; attempt <= MAX_429_RETRIES + 1; attempt++) {
+    if (res.destroyed) return true;
+    let reservation = null;
+    if (hasLimiter(model, slot)) {
+      PROXY_STATE.queued++;
+      try { reservation = await acquire(model, estTokens, 0, slot); } finally { PROXY_STATE.queued--; }
+    }
+    if (res.destroyed) return true;
     const r = await forwardBuffered(req, url, body, model);
 
     if (r.status === 429) {
       const { retryMs } = learnFrom429(model, r.headers, r.text, slot);
-      PROXY_STATE.retries++;
-      log(`upstream 429 for ${model} (compaction, key ${slot || "-"}); waiting ${Math.round(retryMs / 1000)}s (attempt ${attempt})`);
-      if (Date.now() - budgetStart > RATE_LIMIT_BUDGET_MS) {
+      reconcileTokens(reservation, 0, 0);
+      if (attempt > MAX_429_RETRIES || Date.now() - budgetStart + retryMs > RATE_LIMIT_BUDGET_MS) {
+        r.headers["retry-after"] ??= String(Math.ceil(retryMs / 1000));
         writeBuffered(res, r);
         return true;
       }
+      PROXY_STATE.retries++;
+      noteSessionRetry(sessionId, r.status, model);
+      log(`upstream 429 for ${model} (compaction, key ${slot || "-"}); waiting ${Math.round(retryMs / 1000)}s (attempt ${attempt})`);
       await sleep(retryMs);
       continue;
     }
 
+    reconcileTokens(reservation, Math.max(estTokens, usageTokens(r.text) || 0), 0);
     if (!isBlockedCompaction(r)) {
       log(`compaction ok model=${model} status=${r.status} finish=${r.finish || "-"} bytes=${r.text.length}`);
-      settle(r);
       writeBuffered(res, r);
       return true;
     }
 
     log(`compaction blocked model=${model} status=${r.status} finish=${r.finish || "-"}; handing off to ${COMPACTION_MODEL}`);
-    settle(r);
     PROXY_STATE.compactionHandoffs = (PROXY_STATE.compactionHandoffs || 0) + 1;
     const handoffBody = rewriteModel(body, COMPACTION_MODEL);
+    const handoffTokens = estimateTokens(handoffBody, readRequest(handoffBody).maxTokens);
     let handoffReservation = null;
-    if (hasLimiter(COMPACTION_MODEL, slot)) handoffReservation = await acquire(COMPACTION_MODEL, estimateTokens(handoffBody), 0, slot);
+    if (hasLimiter(COMPACTION_MODEL, slot)) handoffReservation = await acquire(COMPACTION_MODEL, handoffTokens, 0, slot);
     const r2 = await forwardBuffered(req, url, handoffBody, COMPACTION_MODEL);
-    reconcileTokens(handoffReservation, estimateTokens(handoffBody), usageTokens(r2.text) || r2.text.length);
+    reconcileTokens(handoffReservation, Math.max(handoffTokens, usageTokens(r2.text) || 0), 0);
     log(`compaction handoff model=${COMPACTION_MODEL} status=${r2.status} finish=${r2.finish || "-"} bytes=${r2.text.length}`);
     writeBuffered(res, r2);
     return true;
@@ -2304,10 +2424,10 @@ function send(res, status, type, text, extra = {}) {  try {
   } catch {}
 }
 
-function sendJson(res, status, text) {
+function sendJson(res, status, text, headers) {
   let type = "application/json";
   try { JSON.parse(text); } catch { type = "text/plain"; }
-  send(res, status, type, text || `{"error":{"message":"upstream ${status}"}}`);
+  send(res, status, type, text || `{"error":{"message":"upstream ${status}"}}`, headers);
 }
 
 // ---- server ----------------------------------------------------------------
