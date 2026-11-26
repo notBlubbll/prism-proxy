@@ -62,6 +62,14 @@ const LIMITS_DEFAULT = "";
 const TOKEN_LIMITS_DEFAULT = "";
 const GLOBAL_LIMITS_DEFAULT = "global=30/60s";
 const GLOBAL_TOKEN_LIMITS_DEFAULT = "global=10000000/60s";
+// Models the panel's "Ping models" button checks when the request names none.
+const PING_MODELS_DEFAULT = [
+  "gpt-6.2-sol", "gpt-6.2-astra", "gpt-6.1-sol", "gpt-6.1-terra",
+  "gpt-6-sol", "gpt-6-luna", "gpt-5.6-terra", "gpt-5.6-luna",
+  "gpt-5.5", "gpt-5.4", "gpt-5.4-nano", "gpt-5.1", "gpt-5",
+  "gpt-4.1", "gpt-4.1-mini", "gpt-4.1-nano", "gpt-4o", "gpt-4o-mini",
+  "gpt-chat-latest", "o3-mini",
+];
 
 // USD per 1M tokens from models.dev (provider `opencode`, falling back to
 // `openai` for models OpenCode does not list). Cache writes are not reported by
@@ -1563,10 +1571,8 @@ async function handle(req, res) {
 
     const models = requested && requested.length
       ? [...new Set(requested)]
-      : [...new Set([
-        ...[...LIMITS].filter(([k]) => k !== "*").map(([k]) => k),
-        ...[...TOKEN_LIMITS].filter(([k]) => k !== "*").map(([k]) => k),
-      ])].sort();
+      : (process.env.PRISM_PROXY_PING_MODELS || PING_MODELS_DEFAULT.join(","))
+        .split(",").map((s) => s.trim()).filter(Boolean);
 
     const auth = req.headers.authorization || lastAuthHeader;
     log(`ping ${models.length} model(s) via POST /ping: ${models.join(" ")}`);
