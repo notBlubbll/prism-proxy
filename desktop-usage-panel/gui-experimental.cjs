@@ -11,7 +11,7 @@
 //
 // Plain DOM, no JSX and no build step: the panel builds its nodes once and
 // updates them in place.
-const { Plugin, Panel, MenuItem, Command, ComposerPill } = require("@opencode/plugin/gui");
+const { Plugin, Panel, MenuItem, Command, ComposerPill, Registry, Contract } = require("@opencode/plugin/gui");
 const { createSignal } = require("solid-js");
 
 // Live retry state from the proxy's /status, read by the composer pill. One
@@ -44,24 +44,6 @@ function elapsedSeconds(session) {
   if (typeof busy !== "number") return 0;
   const elapsed = Math.floor((Date.now() - busy) / 1000);
   return elapsed >= 0 && elapsed < 24 * 60 * 60 ? elapsed : 0;
-}
-
-function sessionProvider(session) {
-  try {
-    const data = session && session.server && session.server.data;
-    const info = data && data.session && data.session.get(session.id);
-    if (!info) return null;
-    if (typeof info.providerID === "string") return info.providerID;
-    const m = info.model;
-    if (typeof m === "string") return m.includes("/") ? m.split("/")[0] : null;
-    if (m && typeof m === "object") {
-      if (typeof m.providerID === "string") return m.providerID;
-      if (typeof m.id === "string" && m.id.includes("/")) return m.id.split("/")[0];
-    }
-    return null;
-  } catch {
-    return null;
-  }
 }
 
 const WINDOWS = ["24u", "24h", "7d", "30d", "all"];
@@ -235,7 +217,6 @@ function buildPanel(endpoint, refreshMs, headingText, getSessionId, getTitle) {
   let keyView = "all";
   const keyFilterBox = document.createElement("span");
   keyFilterBox.style.cssText = "display:inline-flex;gap:4px;margin-left:6px;padding-left:8px;border-left:" + BORDER;
-  head.appendChild(keyFilterBox);
   const keySelect = document.createElement("select");
   keySelect.setAttribute("aria-label", "Usage for key");
   keySelect.style.cssText = [
@@ -246,10 +227,14 @@ function buildPanel(endpoint, refreshMs, headingText, getSessionId, getTitle) {
   keyFilterBox.appendChild(keySelect);
   let keyOptionsSig = "";
   function renderKeyFilter() {
-    // With one key there is nothing to filter; hide the "all keys" selector.
-    const ids = keys.length > 1 ? ["all", ...keys.map((k) => String(k.index))] : keys.map((k) => String(k.index));
-    if (!ids.includes(keyView)) keyView = ids[0] || "all";
-    keyFilterBox.style.display = keys.length > 1 ? "inline-flex" : "none";
+    if (keys.length < 2) {
+      keyView = "all";
+      keyFilterBox.remove();
+      return;
+    }
+    if (!keyFilterBox.parentNode) head.insertBefore(keyFilterBox, refreshBtn);
+    const ids = ["all", ...keys.map((k) => String(k.index))];
+    if (!ids.includes(keyView)) keyView = "all";
     const sig = ids.join(",");
     if (sig !== keyOptionsSig) {
       keyOptionsSig = sig;
@@ -1078,12 +1063,11 @@ module.exports = {
       // plus the proxy's retry state when it is re-sending a request.
       const tickTimer = setInterval(() => setTick((n) => n + 1), 1000);
 
-      ctx.add(ComposerPill, {
-        id: "working",
-        order: 5,
+      const providers = Registry.define("prism-usage.working-providers");
+      ctx.add(providers, {
+        id: "prism",
         show: (input) => {
           tick();
-          if (sessionProvider(input.session) !== "prism") return undefined;
           const seconds = elapsedSeconds(input.session);
           if (seconds === null) return undefined;
           const s = proxyStatus();
@@ -1095,10 +1079,20 @@ module.exports = {
             tone: e ? "warning" : undefined,
             title: e
               ? `${e.model || "request"} returned ${e.status}; the proxy is retrying`
-              : "Session is running",
+              : "Prism is working",
           };
         },
       });
+
+      const working = {
+        show(input) {
+          const session = input.session;
+          const provider = session.server.data.session.get(session.id)?.model?.providerID;
+          return ctx.list(providers).find((entry) => entry.id === provider)?.show(input);
+        },
+      };
+      ctx.provide(Contract.define("prism-usage.working"), working);
+      ctx.add(ComposerPill, { id: "working", order: 5, show: working.show });
 
       const tab = {
         id: "usage",

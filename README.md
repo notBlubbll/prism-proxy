@@ -70,6 +70,10 @@ completions endpoint rejects function tools combined with reasoning
 Responses API accepts them. Responses-only models (`gpt-5*-codex`,
 `gpt-5*-pro`) can be added to the `models` map as well.
 
+If the Responses endpoint returns a transient gateway error (such as HTTP 502)
+before streaming starts, the proxy retries the same request up to five times.
+Each attempt uses a rate-limit slot. An ongoing stream is never replayed.
+
 ## Keys
 
 `keys.json` supports up to 8 keys. The pool exists so a second key is a second
@@ -146,9 +150,11 @@ Costs are list-price estimates, not what PrismRouter bills.
 `desktop-usage-panel/` adds a **Prism usage** tab to the session side region:
 summary cards, one row per model, a 24u / 24h / 7d / 30d / all switch, a refresh
 button, and a working composer pill. It reads `/usage` and `/status` from the
-proxy on `127.0.0.1:17334`. The pill only renders when the current session's
-model belongs to the `prism` provider, so several usage panels never stack
-several "Working" pills.
+proxy on `127.0.0.1:17334`. The key selector appears once there are two keys.
+The panel renders one **Working** pill for the session's active provider. Other
+usage panels can contribute `{ id: providerID, show(input) }` to the GUI registry
+`prism-usage.working-providers` and omit their own pill while the
+`prism-usage.working` contract is active.
 
 Install it next to the proxy plugin:
 
@@ -157,9 +163,9 @@ cp -r desktop-usage-panel ~/.config/opencode/plugins/prism-usage
 opencode reload
 ```
 
-Restart the desktop window after copying; the GUI bundle is read when a window
-starts. Options when the plugin is listed in `opencode.jsonc`: `refreshMs` and
-`usageEndpoint`.
+Open **Prism usage** from the session side panel's **+** menu. OpenCode Desktop
+reloads the local GUI bundle when it changes. Options when the plugin is listed
+in `opencode.jsonc`: `refreshMs` and `usageEndpoint`.
 
 ## Files
 

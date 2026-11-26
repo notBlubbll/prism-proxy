@@ -1664,7 +1664,7 @@ async function handle(req, res) {
   let meta = readRequest(body);
   let model = meta.model;
   const isChat = url.pathname.includes("/chat/completions");
-  const isResponses = url.pathname.includes("/responses");
+  const isResponses = req.method === "POST" && /^\/(?:v1\/)?responses\/?$/.test(url.pathname);
   const sessionId = req.headers["x-opencode-session-id"] || req.headers["x-opencode-session"] || null;
   // With a key pool configured, this request goes out on the key its session is
   // pinned to, and follows that key's windows rather than the shared ones.
@@ -1713,12 +1713,12 @@ async function handle(req, res) {
       model = meta.model || model;
     }
 
-    const estTokens = estimateTokens(body);
+    let estTokens = estimateTokens(body);
     let reservation = null;
     let spilledFrom = null;
 
     // Send this request to the overflow model instead of waiting on `model`.
-    const spillOver = async (why) => {
+    const spillOver = (why) => {
       const rule = OVERFLOW.get(model);
       if (!rule || spilledFrom) return false;
       spilledFrom = model;
@@ -1728,33 +1728,15 @@ async function handle(req, res) {
       overflowStats.set(model, stat);
       log(`overflow ${model} -> ${rule.to} (${why})`);
       body = rewriteModel(body, rule.to);
+      estTokens = estimateTokens(body);
       const from = model;
       model = rule.to;
       spill = { target: rule.to, from };
       markOverflowActive(rule.to, from);
       if (sessionAct) { sessionAct.model = rule.to; sessionAct.spilledFrom = from; }
       reservation = null;
-      if (hasLimiter(model, keySlot)) {
-        PROXY_STATE.queued++;
-        try { reservation = await acquire(model, estTokens, 0, keySlot); } finally { PROXY_STATE.queued--; }
-        if (reservation && !reservation.spill) noteSessionSlot(sessionAct, model, reservation);
-      }
       return true;
     };
-
-    if ((isChat || isResponses) && model && hasLimiter(model, keySlot)) {
-      const rule = OVERFLOW.get(model);
-      const queuedAt = Date.now();
-      PROXY_STATE.queued++;
-      try { reservation = await acquire(model, estTokens, rule ? rule.maxWaitMs : 0, keySlot); } finally { PROXY_STATE.queued--; }
-      if (reservation && reservation.spill) {
-        await spillOver(`a slot would take over ${rule.maxWaitMs / 1000}s`);
-      } else {
-        noteSessionSlot(sessionAct, model, reservation);
-        const waited = Date.now() - queuedAt;
-        if (waited > QUEUE_LOG_MS) log(`slot for ${model} after ${(waited / 1000).toFixed(1)}s`);
-      }
-    }
 
     // A request that carries images may be refused upstream; if so it is retried
     // once with the images captioned. Only possible when a vision model exists.
@@ -1764,11 +1746,26 @@ async function handle(req, res) {
     const maxAttempts = MAX_429_RETRIES + 2;
     let serverAttempts = 0;
     const budgetStart = Date.now();
+    const reserveAttempt = async (maxWaitMs) => {
+      PROXY_STATE.queued++;
+      try { return await acquire(model, estTokens, maxWaitMs, keySlot); } finally { PROXY_STATE.queued--; }
+    };
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      if (res.destroyed || res.writableEnded) return;
+      if ((isChat || isResponses) && model && hasLimiter(model, keySlot)) {
+        const rule = !spilledFrom && OVERFLOW.get(model);
+        reservation = await reserveAttempt(rule ? rule.maxWaitMs : 0);
+        if (reservation?.spill) {
+          spillOver(`a slot would take over ${rule.maxWaitMs / 1000}s`);
+          reservation = await reserveAttempt(0);
+        }
+        noteSessionSlot(sessionAct, model, reservation);
+      }
+      if (res.destroyed || res.writableEnded) return;
       const result = await forward(req, res, url, body, model, isChat, {
         headers: spilledFrom ? { "x-prism-overflow": `${spilledFrom}->${model}` } : {},
         imageFallback,
-        retry5xx: true,
+        retry5xx: isChat || isResponses,
       });
       if (result.done) {
         reconcileTokens(reservation, estTokens, result.bytes);
@@ -1784,6 +1781,7 @@ async function handle(req, res) {
         imageFallback = false;
         log(`upstream rejected an image request for ${model} (400); retrying with captions :: ${String(result.text).replace(/\s+/g, " ").slice(0, 160)}`);
         body = await visionHandoff(body, model, req.headers.authorization, true, keySlot);
+        estTokens = estimateTokens(body);
         continue;
       }
       if (result.serverError) {
@@ -1796,7 +1794,7 @@ async function handle(req, res) {
         PROXY_STATE.retries5xx = (PROXY_STATE.retries5xx || 0) + 1;
         noteSessionRetry(sessionId, result.status, model);
         const refused = result.text?.includes("upstream_rejected_request") || result.text?.includes("Provider returned error");
-        if (attemptNo > MAX_5XX_RETRIES || refused || Date.now() - budgetStart > RATE_LIMIT_BUDGET_MS) {
+        if (attemptNo > MAX_5XX_RETRIES || attempt === maxAttempts || refused || Date.now() - budgetStart > RATE_LIMIT_BUDGET_MS) {
           log(`upstream ${result.status} for ${model} after ${attemptNo - 1} retries${refused ? " (provider refused the body)" : ""}; forwarding it (${body.length} bytes)`);
           clearSessionRetry(sessionId);
           return sendJson(res, result.status, result.text);
@@ -1806,7 +1804,7 @@ async function handle(req, res) {
         await sleep(wait);
         continue;
       }
-      if (Date.now() - budgetStart > RATE_LIMIT_BUDGET_MS) {
+      if (attempt === maxAttempts || Date.now() - budgetStart > RATE_LIMIT_BUDGET_MS) {
         log(`429 budget exhausted for ${model}, forwarding the 429`);
         return sendJson(res, result.status, result.text);
       }
@@ -1814,7 +1812,7 @@ async function handle(req, res) {
       PROXY_STATE.retries++;
       const rule = OVERFLOW.get(model);
       if (rule && !spilledFrom && retryMs > rule.maxWaitMs) {
-        await spillOver(`upstream 429, retry in ${Math.round(retryMs / 1000)}s`);
+        spillOver(`upstream 429, retry in ${Math.round(retryMs / 1000)}s`);
         continue;
       }
       log(`upstream 429 for ${model}; waiting ${Math.round(retryMs / 1000)}s (attempt ${attempt}/${maxAttempts})`);
@@ -1924,7 +1922,7 @@ function forward(req, res, url, body, model, isChat, opts = {}) {
       // provider failed after the HTTP status was already 200. Buffer the first
       // chunk and check before anything reaches the client, so the turn can be
       // retried instead of failing with "Provider returned error".
-      const sse = status === 200 && String(hdrs["content-type"] || "").includes("event-stream");
+      const sse = isChat && status === 200 && String(hdrs["content-type"] || "").includes("event-stream");
       let held = null; // first chunk, kept until we know it is not an error
       let holdDone = false; // held chunk released to the client (or consumed)
 
@@ -1941,7 +1939,8 @@ function forward(req, res, url, body, model, isChat, opts = {}) {
         // Always leave a trace of a non-2xx: this is what makes a failed turn
         // attributable instead of an opaque "blocked by the provider".
         const ct = String(hdrs["content-type"] || "");
-        if (!ct.includes("event-stream")) {
+        const retryable = opts.retry5xx && (isChat ? status >= 500 : [502, 503, 504, 520, 522, 524].includes(status));
+        if (retryable || !ct.includes("event-stream")) {
           const chunks = [];
           let size = 0;
           upRes.on("data", (c) => { if (size < 65536) { chunks.push(c); size += c.length; } });
@@ -1950,7 +1949,9 @@ function forward(req, res, url, body, model, isChat, opts = {}) {
             log(`res ${status} model=${model || "-"} :: ${text.replace(/\s+/g, " ").slice(0, 400)}`);
             if (status === 429 && isChat && model) return finish({ retry: true, status, headers: rawRes.headers, text });
             // Transient 5xx: let the caller retry the same body.
-            if (status >= 500 && isChat && opts.retry5xx) return finish({ serverError: true, status, headers: rawRes.headers, text });
+            if (retryable) {
+              return finish({ serverError: true, status, headers: rawRes.headers, text });
+            }
             // The upstream refused a request that carries images: let the caller
             // retry once with the images captioned instead of failing the turn.
             if (status === 400 && opts.imageFallback) return finish({ visionFallback: true, status, text });
@@ -1959,6 +1960,7 @@ function forward(req, res, url, body, model, isChat, opts = {}) {
             finish({ done: true });
           });
           upRes.on("error", () => {
+            if (retryable) return finish({ serverError: true, status, headers: rawRes.headers, text: "" });
             if (status === 429 && isChat && model) return finish({ retry: true, status, headers: upRes.headers, text: "" });
             try { res.end(); } catch {}
             finish({ done: true });
