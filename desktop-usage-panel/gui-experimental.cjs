@@ -1,0 +1,1140 @@
+// desktop-usage-panel — OpenCode Desktop GUI part.
+//
+// Adds a "Prism usage" tab to the session side region: summary cards, a
+// per-model table with input/output/reasoning/cached tokens, average output
+// TPS, average latency and estimated cost, plus a titled totals row. Windows:
+// 24h / 7d / 30d / all. Data comes from the proxy's GET /usage endpoint.
+//
+// Loaded by the desktop from this prebuilt CommonJS bundle:
+//   Function("require","module","exports", code)(sharedRequire, module, module.exports)
+// `@opencode/plugin/gui` and `solid-js` are provided by the app at runtime.
+//
+// Plain DOM, no JSX and no build step: the panel builds its nodes once and
+// updates them in place.
+const { Plugin, Panel, MenuItem, Command, ComposerPill } = require("@opencode/plugin/gui");
+const { createSignal } = require("solid-js");
+
+// Live retry state from the proxy's /status, read by the composer pill. One
+// signal for every window, refreshed once a second.
+const [proxyStatus, setProxyStatus] = createSignal(null);
+// One shared 1s ticker; reading `tick()` in a pill makes the host re-run it.
+const [tick, setTick] = createSignal(0);
+
+function formatSeconds(total) {
+  if (total < 60) return `${total}s`;
+  const minutes = Math.floor(total / 60);
+  const seconds = total % 60;
+  return seconds ? `${minutes}m ${seconds}s` : `${minutes}m`;
+}
+
+// Elapsed time of the routed session, or null when it is not working.
+function elapsedSeconds(session) {
+  const data = session && session.server && session.server.data;
+  if (!data) return null;
+  const id = session.id;
+  let running = false;
+  try {
+    running = typeof data.session.status === "function" && data.session.status(id) === "running";
+  } catch {}
+  const info = data.session.get(id);
+  const busy = info && info.time && info.time.busy;
+  const idle = info && info.time && info.time.idle;
+  const byTime = typeof busy === "number" && (typeof idle !== "number" || busy > idle);
+  if (!running && !byTime) return null;
+  if (typeof busy !== "number") return 0;
+  const elapsed = Math.floor((Date.now() - busy) / 1000);
+  return elapsed >= 0 && elapsed < 24 * 60 * 60 ? elapsed : 0;
+}
+
+const WINDOWS = ["24u", "24h", "7d", "30d", "all"];
+
+// Readable names for model ids. Unknown ids fall back to the id itself.
+const MODEL_NAMES = {
+  "gpt-6.2-sol": "GPT-6.2 Sol",
+  "gpt-6.2-astra": "GPT-6.2 Astra",
+  "gpt-6.1-sol": "GPT-6.1 Sol",
+  "gpt-6.1-terra": "GPT-6.1 Terra",
+  "gpt-6-sol": "GPT-6 Sol",
+  "gpt-6-luna": "GPT-6 Luna",
+  "gpt-5.6-terra": "GPT-5.6 Terra",
+  "gpt-5.6-luna": "GPT-5.6 Luna",
+  "gpt-5.5": "GPT-5.5",
+  "gpt-5.4": "GPT-5.4",
+  "gpt-5.4-nano": "GPT-5.4 Nano",
+  "gpt-5.1": "GPT-5.1",
+  "gpt-5": "GPT-5",
+  "gpt-4.1": "GPT-4.1",
+  "gpt-4.1-mini": "GPT-4.1 Mini",
+  "gpt-4.1-nano": "GPT-4.1 Nano",
+  "gpt-4o": "GPT-4o",
+  "gpt-4o-mini": "GPT-4o Mini",
+  "gpt-chat-latest": "GPT Chat Latest",
+  "o3-mini": "o3-mini",
+};
+const displayModel = (id) => MODEL_NAMES[id] || String(id || "");
+// Shown in place of a saved key. The real value is only fetched on Show.
+const KEY_MASK = "••••••••••••••••";
+const COLUMNS = [
+  { key: "model", label: "Model", align: "left" },
+  { key: "requests", label: "Req", align: "right" },
+  { key: "input", label: "In", align: "right" },
+  { key: "output", label: "Out", align: "right" },
+  { key: "reasoning", label: "Reason", align: "right" },
+  { key: "cached", label: "Cached", align: "right",
+    title: "Share of input tokens served from the provider's prompt cache: cached ÷ input. Input already includes the cached tokens." },
+  { key: "avgTps", label: "tok/s", align: "right",
+    title: "Decode speed: output tokens after the first one ÷ time between the first and last streamed token. Excludes time to first token, and replies under 16 tokens." },
+  { key: "ttftMs", label: "ttft", align: "right",
+    title: "Time to first token: from sending the request to the first streamed text, averaged." },
+  { key: "avgMs", label: "avg", align: "right",
+    title: "Average total request time, start to finish." },
+  { key: "cost", label: "$", align: "right" },
+];
+
+function fmt(n) {
+  const v = Number(n) || 0;
+  if (v >= 1e9) return (v / 1e9).toFixed(2) + "B";
+  if (v >= 1e6) return (v / 1e6).toFixed(1) + "M";
+  if (v >= 1e3) return (v / 1e3).toFixed(1) + "k";
+  return String(v);
+}
+
+// Latencies are shown in seconds everywhere: 13888 ms reads as 13.888s, and
+// anything under a second keeps three decimals so short calls stay readable.
+function secs(ms) {
+  const v = Number(ms) || 0;
+  if (v <= 0) return "—";
+  return (v / 1000).toFixed(3) + "s";
+}
+
+// Cached share of the prompt. The gateway reports prompt tokens including the
+// cached ones (OpenAI-style usage), so the ratio is simply cached / input.
+function cachedPct(cached, input) {
+  const c = Number(cached) || 0;
+  const i = Number(input) || 0;
+  if (i <= 0) return "—";
+  return ((c / i) * 100).toFixed(1) + "%";
+}
+
+function cachedTitle(cached, input) {
+  const c = Number(cached) || 0;
+  const i = Number(input) || 0;
+  if (i <= 0) return "no input tokens in this window";
+  return `${c.toLocaleString()} cached ÷ ${i.toLocaleString()} input tokens = ${((c / i) * 100).toFixed(2)}%\n` +
+    "Imported history is left out: it has no cache data. Claude models only cache when the request carries cache_control (compatibility.cacheFormat).";
+}
+
+function tpsTitle(s) {
+  if (!s || !s.avgTps) return "no streamed replies long enough to measure yet";
+  return [
+    `average ${s.avgTps} tok/s (all measured tokens ÷ all generation time)`,
+    `mean of requests ${s.meanTps || 0} · median ${s.medTps || 0} · latest ${s.lastTps || 0}`,
+    `${s.tpsN || 0} request(s) measured`,
+  ].join("\n");
+}
+
+// "3m", "42s", "2h": how long a session has been quiet.
+function idleText(ms) {
+  const s = Math.max(0, Math.round((Number(ms) || 0) / 1000));
+  if (s < 60) return s + "s";
+  if (s < 3600) return Math.floor(s / 60) + "m";
+  return Math.floor(s / 3600) + "h";
+}
+
+function ttftTitle(s) {
+  if (!s || !s.ttftMs) return "no streamed replies to measure yet";
+  return `average over ${s.ttftN || 0} request(s)`;
+}
+
+function money(n) {
+  const v = Number(n) || 0;
+  if (v === 0) return "$0.00";
+  if (v < 0.01) return "$" + v.toFixed(4);
+  return "$" + v.toFixed(2);
+}
+
+const BORDER = "1px solid rgba(127,127,127,.18)";
+
+function buildPanel(endpoint, refreshMs, headingText, getSessionId, getTitle) {
+  const sessionId = () => {
+    try { return typeof getSessionId === "function" ? getSessionId() : null; } catch { return null; }
+  };
+  const titleOf = (id) => {
+    try { return typeof getTitle === "function" ? getTitle(id) : null; } catch { return null; }
+  };
+  const root = document.createElement("div");
+  root.style.cssText = [
+    "padding:14px",
+    "font:12px/1.5 ui-sans-serif,system-ui,-apple-system,sans-serif",
+    "color:inherit",
+    "height:100%",
+    "overflow:auto",
+    "box-sizing:border-box",
+    "display:flex",
+    "flex-direction:column",
+    "gap:12px",
+    // The app disables selection on chrome-like surfaces; keep the numbers
+    // copyable with the mouse.
+    "user-select:text",
+    "-webkit-user-select:text",
+    "cursor:auto",
+  ].join(";");
+
+  // ---- header -------------------------------------------------------------
+  const head = document.createElement("div");
+  head.style.cssText = "display:flex;align-items:center;gap:6px;flex-wrap:wrap";
+
+  const heading = document.createElement("div");
+  heading.textContent = headingText || "Usage";
+  heading.style.cssText = "font-weight:650;font-size:13px;margin-right:auto;letter-spacing:.01em";
+  head.appendChild(heading);
+
+  let win = "24u";
+  const buttons = {};
+  for (const w of WINDOWS) {
+    const b = document.createElement("button");
+    b.type = "button";
+    b.textContent = w;
+    if (w === "24u") b.title = "Since 00:00 UTC today";
+    if (w === "24h") b.title = "Last 24 hours";
+    b.style.cssText = [
+      "padding:3px 9px",
+      "border-radius:999px",
+      "border:1px solid rgba(127,127,127,.3)",
+      "background:transparent",
+      "color:inherit",
+      "cursor:pointer",
+      "font:inherit",
+      "line-height:1.5",
+      "transition:background .12s",
+    ].join(";");
+    b.onclick = () => { win = w; paint(); };
+    buttons[w] = b;
+    head.appendChild(b);
+  }
+
+  // Key filter next to the window pills: "all" (combined, the default) or one key.
+  let keyView = "all";
+  const keyFilterBox = document.createElement("span");
+  keyFilterBox.style.cssText = "display:inline-flex;gap:4px;margin-left:6px;padding-left:8px;border-left:" + BORDER;
+  head.appendChild(keyFilterBox);
+  const keySelect = document.createElement("select");
+  keySelect.setAttribute("aria-label", "Usage for key");
+  keySelect.style.cssText = [
+    "padding:3px 8px", "border-radius:999px", "border:1px solid rgba(127,127,127,.3)",
+    "background:transparent", "color:inherit", "cursor:pointer", "font:inherit", "line-height:1.5",
+  ].join(";");
+  keySelect.onchange = () => { keyView = keySelect.value; paint(); };
+  keyFilterBox.appendChild(keySelect);
+  let keyOptionsSig = "";
+  function renderKeyFilter() {
+    const ids = ["all", ...keys.map((k) => String(k.index))];
+    if (!ids.includes(keyView)) keyView = "all";
+    const sig = ids.join(",");
+    if (sig !== keyOptionsSig) {
+      keyOptionsSig = sig;
+      keySelect.textContent = "";
+      for (const id of ids) {
+        const o = document.createElement("option");
+        o.value = id;
+        o.textContent = id === "all" ? "all keys" : "key " + id;
+        keySelect.appendChild(o);
+      }
+    }
+    keySelect.value = keyView;
+  }
+
+  const refreshBtn = document.createElement("button");
+  refreshBtn.type = "button";
+  refreshBtn.textContent = "↻";
+  refreshBtn.title = "Refresh now";
+  refreshBtn.setAttribute("aria-label", "Refresh now");
+  refreshBtn.style.cssText = [
+    "padding:3px 9px",
+    "border-radius:999px",
+    "border:1px solid rgba(127,127,127,.3)",
+    "background:transparent",
+    "color:inherit",
+    "cursor:pointer",
+    "font:inherit",
+    "line-height:1.5",
+  ].join(";");
+  refreshBtn.onclick = () => { refresh(); };
+  head.appendChild(refreshBtn);
+  root.appendChild(head);
+
+  // ---- summary cards ------------------------------------------------------
+  const cards = document.createElement("div");
+  cards.style.cssText = "display:grid;grid-template-columns:repeat(auto-fit,minmax(92px,1fr));gap:8px";
+  root.appendChild(cards);
+
+  const cardValues = {};
+  for (const [key, label] of [["requests", "Requests"], ["input", "Input"], ["output", "Output"], ["cost", "Cost"]]) {
+    const card = document.createElement("div");
+    card.style.cssText = [
+      "padding:9px 11px",
+      "border-radius:9px",
+      "background:rgba(127,127,127,.08)",
+      "border:" + BORDER,
+      "min-width:0",
+    ].join(";");
+    const k = document.createElement("div");
+    k.textContent = label;
+    k.style.cssText = "font-size:10px;letter-spacing:.06em;text-transform:uppercase;opacity:.55";
+    const v = document.createElement("div");
+    v.textContent = "—";
+    v.style.cssText = "font-size:16px;font-weight:650;margin-top:3px;font-variant-numeric:tabular-nums;white-space:nowrap";
+    card.appendChild(k);
+    card.appendChild(v);
+    cards.appendChild(card);
+    cardValues[key] = v;
+  }
+
+  // ---- table --------------------------------------------------------------
+  const table = document.createElement("table");
+  table.style.cssText = "width:100%;border-collapse:collapse;font-variant-numeric:tabular-nums;user-select:text;-webkit-user-select:text";
+  root.appendChild(table);
+
+  const footer = document.createElement("div");
+  footer.style.cssText = "margin-top:auto;padding-top:6px;opacity:.5;font-size:11px";
+  root.appendChild(footer);
+
+  // ---- sessions ------------------------------------------------------------
+  // Who is using which key right now. One session is glued to one key, so this is
+  // also the answer to "which key is busy".
+  let sessions = [];
+  const sessionsBox = document.createElement("div");
+  sessionsBox.style.cssText = "border-top:" + BORDER + ";padding-top:10px;display:flex;flex-direction:column;gap:6px";
+  const sessionsHead = document.createElement("div");
+  sessionsHead.textContent = "Sessions";
+  sessionsHead.style.cssText = "font-size:11px;font-weight:650;letter-spacing:.04em;text-transform:uppercase;opacity:.55";
+  const sessionsList = document.createElement("div");
+  sessionsList.style.cssText = "display:flex;flex-direction:column;gap:3px";
+  sessionsBox.appendChild(sessionsHead);
+  sessionsBox.appendChild(sessionsList);
+  // Sits between the table and the footer, i.e. in the middle of the panel.
+  root.insertBefore(sessionsBox, footer);
+
+  function renderSessions() {
+    sessionsList.textContent = "";
+    if (!sessions.length) {
+      const empty = document.createElement("div");
+      empty.textContent = "no sessions in the last 30 minutes";
+      empty.style.cssText = "opacity:.5;font-size:11px";
+      sessionsList.appendChild(empty);
+      return;
+    }
+    const here = sessionId();
+    const tbl = document.createElement("table");
+    tbl.style.cssText = "width:100%;border-collapse:collapse;font-size:12px;user-select:text;-webkit-user-select:text;cursor:text";
+    const head = document.createElement("tr");
+    head.appendChild(th("Session", "left"));
+    head.appendChild(th("Key", "center", "the key this session is pinned to; all its requests use that key's limits"));
+    head.appendChild(th("Model", "left"));
+    head.appendChild(th("Req", "right", "requests this session sent in the last minute / its key's per-minute cap for the model. Empty once the minute has passed."));
+    head.appendChild(th("TPM", "right", "tokens this session used in the last minute, as a share of its key's per-minute token cap for the model. Empty once the minute has passed."));
+    head.appendChild(th("State", "left"));
+    tbl.appendChild(head);
+
+    sessions.forEach((s, i) => {
+      const last = i === sessions.length - 1;
+      const tr = document.createElement("tr");
+      tr.title = s.id;
+
+      const title = titleOf(s.id) || `${s.id.slice(0, 8)}…${s.id.slice(-4)}`;
+      const name = td(title + (s.id === here ? "  · this one" : ""), "left", { last, strong: s.id === here, model: true });
+      name.title = s.id;
+      tr.appendChild(name);
+
+      tr.appendChild(td(s.key ? `Key ${s.key}` : "no key", "center", { last, muted: !s.key, strong: s.active > 0 }));
+
+      // A session that overflowed shows the model actually serving it, with a *
+      // and the model it was meant for in the tooltip.
+      const spilled = !!s.from && !!s.model;
+      tr.appendChild(td(s.model ? displayModel(s.model) + (spilled ? " *" : "") : "–", "left", {
+        last, muted: !s.model, model: true,
+        title: spilled ? `overflow: ${displayModel(s.from)} was full, so this session's request runs on ${displayModel(s.model)} (${s.model})` : (s.model || ""),
+      }));
+
+      const lim = s.limit;
+      // Both figures are rolling-minute counts that the proxy recomputes on every
+      // poll, so they empty by themselves as requests age out of the window.
+      const reqShown = !!lim && lim.max > 0 && lim.used > 0;
+      tr.appendChild(td(reqShown ? `${lim.used}/${lim.max}` : "–", "right", {
+        last, muted: !reqShown, strong: reqShown && lim.used >= lim.max,
+        title: lim && lim.max > 0
+          ? `this session: ${lim.used} of ${lim.max} requests in the last ${Math.round(lim.windowMs / 1000)}s on Key ${s.key} (${s.model})\n` +
+            `everyone on Key ${s.key}: ${lim.keyUsed} of ${lim.max}`
+          : "",
+      }));
+
+      const tpmShown = !!lim && lim.tokenMax > 0 && lim.tokens > 0;
+      const tpm = tpmShown ? (lim.tokens / lim.tokenMax) * 100 : 0;
+      tr.appendChild(td(tpmShown ? `${tpm < 10 ? tpm.toFixed(1) : Math.round(tpm)}%` : "–", "right", {
+        last, muted: !tpmShown, strong: tpmShown && tpm >= 100,
+        title: lim && lim.tokenMax > 0
+          ? `this session: ${lim.tokens.toLocaleString()} of ${lim.tokenMax.toLocaleString()} tokens in the last ${Math.round(lim.tokenWindowMs / 1000)}s on Key ${s.key} (${s.model})\n` +
+            `everyone on Key ${s.key}: ${lim.keyTokens.toLocaleString()} (${((lim.keyTokens / lim.tokenMax) * 100).toFixed(1)}%)`
+          : "",
+      }));
+
+      const state = td("", "left", { last });
+      if (s.active > 0) {
+        state.textContent = `● ${s.active} running`;
+        state.style.color = "rgb(80,170,110)";
+        state.style.fontWeight = "650";
+      } else {
+        state.textContent = `idle ${idleText(s.idleMs)}`;
+        state.style.opacity = ".5";
+      }
+      state.style.fontVariantNumeric = "tabular-nums";
+      tr.appendChild(state);
+
+      tbl.appendChild(tr);
+    });
+    sessionsList.appendChild(tbl);
+  }
+
+  renderSessions();
+
+  // ---- manual ping ---------------------------------------------------------
+  // One tiny prompt per model at the push of a button, to see which models are
+  // alive and what each calls itself.
+  const pingBox = document.createElement("div");
+  pingBox.style.cssText = "border-top:" + BORDER + ";padding-top:10px;display:flex;flex-direction:column;gap:8px";
+
+  const pingRow = document.createElement("div");
+  pingRow.style.cssText = "display:flex;align-items:center;gap:8px";
+
+  const pingBtn = document.createElement("button");
+  pingBtn.type = "button";
+  pingBtn.textContent = "Ping models";
+  pingBtn.style.cssText = [
+    "padding:4px 12px",
+    "border-radius:8px",
+    "border:1px solid rgba(127,127,127,.35)",
+    "background:rgba(127,127,127,.08)",
+    "color:inherit",
+    "cursor:pointer",
+    "font:inherit",
+    "font-weight:600",
+  ].join(";");
+  pingRow.appendChild(pingBtn);
+
+  // One-click copy of the whole result as tab-separated rows, so it pastes into
+  // a sheet or chat. The table itself is selectable too.
+  const COPY_LABEL = "Copy for Discord";
+  const copyBtn = document.createElement("button");
+  copyBtn.type = "button";
+  copyBtn.textContent = COPY_LABEL;
+  copyBtn.disabled = true;
+  copyBtn.style.cssText = [
+    "padding:4px 10px", "border-radius:8px", "border:1px solid rgba(127,127,127,.35)",
+    "background:transparent", "color:inherit", "cursor:pointer", "font:inherit",
+    "font-weight:600", "opacity:.45",
+  ].join(";");
+  pingRow.appendChild(copyBtn);
+
+  const pingNote = document.createElement("span");
+  pingNote.textContent = '"state your model and say pong"';
+  pingNote.style.cssText = "opacity:.5;font-size:11px";
+  pingRow.appendChild(pingNote);
+  pingBox.appendChild(pingRow);
+
+  const pingOut = document.createElement("div");
+  pingOut.style.cssText = "overflow:auto;font-variant-numeric:tabular-nums";
+  pingBox.appendChild(pingOut);
+  root.appendChild(pingBox);
+
+  let pingText = "";
+  // A monospace table inside a code block: Discord keeps the padding, so the
+  // columns line up when pasted as one message.
+  function discordPingTable(results) {
+    const rows = results.map((p) => [
+      displayModel(p.model),
+      p.ok ? "ok" : p.skipped ? "skipped" : "failed",
+      p.ms ? secs(p.ms) : "-",
+      String((p.ok ? p.text : p.error) || "").replace(/\s+/g, " ").trim(),
+    ]);
+    const head = ["Model", "Status", "Time", "Reply"];
+    const widths = [0, 1, 2].map((i) => Math.max(head[i].length, ...rows.map((r) => r[i].length)));
+    const line = (cells) => `${cells[0].padEnd(widths[0])}  ${cells[1].padEnd(widths[1])}  ${cells[2].padEnd(widths[2])}  ${cells[3]}`;
+    const body = [head, ...rows].map(line).join("\n").replace(/```/g, "'''");
+    return "```\n" + body + "\n```";
+  }
+  const setCopyState = (enabled) => {
+    copyBtn.disabled = !enabled;
+    copyBtn.style.opacity = enabled ? "1" : ".45";
+    copyBtn.textContent = COPY_LABEL;
+  };
+  copyBtn.onclick = async () => {
+    if (!pingText) return;
+    // execCommand through a focused textarea first: it does not depend on the
+    // clipboard permission the desktop shell may deny.
+    let ok = false;
+    const ta = document.createElement("textarea");
+    ta.value = pingText;
+    ta.setAttribute("readonly", "");
+    ta.style.cssText = "position:fixed;top:0;left:0;width:1px;height:1px;padding:0;border:0;opacity:0";
+    document.body.appendChild(ta);
+    ta.focus();
+    ta.select();
+    try { ok = document.execCommand("copy"); } catch {}
+    ta.remove();
+    if (!ok && navigator.clipboard?.writeText) {
+      try { await navigator.clipboard.writeText(pingText); ok = true; } catch {}
+    }
+    copyBtn.textContent = ok ? "Copied" : "Copy failed";
+    setTimeout(() => { copyBtn.textContent = COPY_LABEL; }, 1400);
+  };
+
+  let pingBusy = false;
+  async function ping() {
+    if (pingBusy) return;
+    pingBusy = true;
+    pingBtn.disabled = true;
+    pingBtn.style.opacity = ".55";
+    pingBtn.textContent = "Pinging…";
+    pingOut.textContent = "";
+    pingText = "";
+    setCopyState(false);
+    const waiting = document.createElement("div");
+    waiting.textContent = "asking every model…";
+    waiting.style.cssText = "opacity:.6";
+    pingOut.appendChild(waiting);
+    try {
+      const r = await fetch(endpoint.replace(/\/usage\/?$/, "/ping"), { method: "POST", cache: "no-store" });
+      const j = await r.json();
+      pingOut.textContent = "";
+      const results = j.results || [];
+      if (!results.length) {
+        const none = document.createElement("div");
+        none.textContent = "no models answered";
+        none.style.cssText = "opacity:.6";
+        pingOut.appendChild(none);
+      } else {
+        const tbl = document.createElement("table");
+        tbl.style.cssText = "width:100%;border-collapse:collapse;font-size:12px;user-select:text;-webkit-user-select:text;cursor:text";
+        const head = document.createElement("tr");
+        head.appendChild(th("Model", "left"));
+        head.appendChild(th("Status", "left"));
+        head.appendChild(th("Reply", "left"));
+        head.appendChild(th("Time", "right"));
+        tbl.appendChild(head);
+        results.forEach((p, i) => {
+          const last = i === results.length - 1;
+          const tr = document.createElement("tr");
+          tr.appendChild(td(displayModel(p.model), "left", { last, title: p.model, model: true }));
+          const status = p.ok ? "ok" : p.skipped ? "skipped" : "failed";
+          const st = td(status, "left", { last, muted: !p.ok, strong: p.ok });
+          if (!p.ok) st.style.color = "rgb(190,110,90)";
+          tr.appendChild(st);
+          const reply = td(p.ok ? (p.text || "") : (p.error || ""), "left", {
+            last, muted: !p.ok,
+            title: p.ok ? "" : `${p.model}: ${p.error || ""}`,
+          });
+          reply.style.whiteSpace = "pre-wrap";
+          reply.style.wordBreak = "break-word";
+          reply.style.maxWidth = "340px";
+          tr.appendChild(reply);
+          tr.appendChild(td(p.ms ? secs(p.ms) : "-", "right", { last, muted: !p.ms }));
+          tbl.appendChild(tr);
+        });
+        pingOut.appendChild(tbl);
+        pingText = discordPingTable(results);
+        setCopyState(true);
+      }
+      // pings are real requests, so refresh the numbers too
+      refresh();
+    } catch (e) {
+      pingOut.textContent = "";
+      pingText = "";
+      setCopyState(false);
+      const err = document.createElement("div");
+      err.textContent = "ping failed: " + ((e && e.message) || "unreachable");
+      err.style.cssText = "opacity:.6";
+      pingOut.appendChild(err);
+    } finally {
+      pingBusy = false;
+      pingBtn.disabled = false;
+      pingBtn.style.opacity = "1";
+      pingBtn.textContent = "Ping models";
+    }
+  }
+  pingBtn.onclick = ping;
+
+  // ---- keys ---------------------------------------------------------------
+  // The gateway meters each key separately, so a second key is a second set of
+  // per-model windows. Stored next to the plugin, never in opencode.json.
+  let keys = [];
+  let pins = {};
+  const keysUrl = endpoint.replace(/\/usage\/?$/, "/keys");
+  const keyBox = document.createElement("div");
+  keyBox.style.cssText = "border-top:" + BORDER + ";padding-top:10px;display:flex;flex-direction:column;gap:6px";
+
+  const keyHead = document.createElement("div");
+  // Collapsed by default: keys are masked, but there is no reason to keep them on
+  // screen. Click the heading to open.
+  let keysOpen = false;
+  keyHead.style.cssText = "font-size:11px;font-weight:650;letter-spacing:.04em;text-transform:uppercase;opacity:.55;cursor:pointer;user-select:none;-webkit-user-select:none";
+  keyHead.setAttribute("role", "button");
+  keyHead.tabIndex = 0;
+  keyBox.appendChild(keyHead);
+
+  const keyList = document.createElement("div");
+  keyList.style.cssText = "display:flex;flex-direction:column;gap:3px";
+  keyBox.appendChild(keyList);
+
+  const keyNote = document.createElement("div");
+  keyNote.style.cssText = "opacity:.5;font-size:11px";
+  keyNote.textContent = "saved to keys.json - each session sticks to one key";
+  keyBox.appendChild(keyNote);
+  root.appendChild(keyBox);
+
+  function paintKeysOpen() {
+    keyHead.textContent = `${keysOpen ? "▾" : "▸"} Keys` + (keys.length ? ` · ${keys.length}` : "");
+    keyHead.setAttribute("aria-expanded", String(keysOpen));
+    keyHead.title = keysOpen ? "Hide keys" : "Show keys";
+    keyList.style.display = keysOpen ? "flex" : "none";
+    keyNote.style.display = keysOpen ? "block" : "none";
+  }
+  keyHead.onclick = () => { keysOpen = !keysOpen; paintKeysOpen(); };
+  keyHead.onkeydown = (e) => {
+    if (e.key === "Enter" || e.key === " ") { e.preventDefault(); keyHead.onclick(); }
+  };
+  paintKeysOpen();
+
+  // Rows exist only for keys that are configured. Each row is one masked field
+  // and four actions: Show reveals the value, Edit makes the field editable
+  // (Save applies it), Pin glues the routed session to that key, × removes it.
+  const keyCss = {
+    field: [
+      "width:100%", "box-sizing:border-box", "height:26px", "padding:0 8px", "border-radius:7px",
+      "border:1px solid rgba(127,127,127,.35)", "background:transparent", "color:inherit",
+      "font:inherit", "font-variant-numeric:tabular-nums",
+    ].join(";"),
+    button: [
+      "height:26px", "padding:0 8px", "border-radius:7px", "border:1px solid rgba(127,127,127,.35)",
+      "background:rgba(127,127,127,.08)", "color:inherit", "cursor:pointer", "font:inherit",
+      "font-weight:600", "white-space:nowrap",
+    ].join(";"),
+  };
+  const keyButton = (text, title, extra) => {
+    const b = document.createElement("button");
+    b.type = "button";
+    b.textContent = text;
+    b.title = title || "";
+    b.style.cssText = keyCss.button + ";" + (extra || "");
+    return b;
+  };
+  const keyPlaceholder = () => {
+    const s = document.createElement("span");
+    s.style.visibility = "hidden";
+    return s;
+  };
+  let keySig = "";
+
+  function renderKeys() {
+    paintKeysOpen();
+    keyList.textContent = "";
+    if (keys.length === 0) {
+      const empty = document.createElement("div");
+      empty.textContent = "no keys yet — OpenCode's own credential is used until you add one";
+      empty.style.cssText = "opacity:.5;font-size:11px";
+      keyList.appendChild(empty);
+      return;
+    }
+    const rowStyle = "display:grid;grid-template-columns:minmax(0,1fr) 58px 58px 62px 26px;gap:6px;align-items:center";
+
+    keys.forEach((current, idx) => {
+      const i = idx + 1;
+      const row = document.createElement("div");
+      row.style.cssText = rowStyle;
+
+      const input = document.createElement("input");
+      input.type = "password";
+      input.readOnly = true;
+      input.autocomplete = "off";
+      input.spellcheck = false;
+      input.value = KEY_MASK;
+      input.title = current.hint;
+      input.style.cssText = keyCss.field;
+
+      let editing = false;
+      const reveal = keyButton("Show", `Show key ${i}`);
+      reveal.onclick = async () => {
+        if (editing) return;
+        if (input.type === "text") {
+          input.type = "password";
+          input.value = KEY_MASK;
+          reveal.textContent = "Show";
+          return;
+        }
+        try {
+          const r = await fetch(`${keysUrl}/reveal?slot=${i}`, { cache: "no-store" });
+          const j = await r.json();
+          if (!r.ok) throw new Error(j.error || "HTTP " + r.status);
+          input.type = "text";
+          input.value = j.key;
+          reveal.textContent = "Hide";
+        } catch (e) {
+          keyNote.textContent = "reveal failed: " + ((e && e.message) || "unreachable");
+        }
+      };
+
+      const finishEdit = () => {
+        editing = false;
+        input.readOnly = true;
+        input.type = "password";
+        input.value = KEY_MASK;
+        input.placeholder = "";
+        edit.textContent = "Edit";
+        reveal.style.opacity = "1";
+        reveal.disabled = false;
+      };
+      const edit = keyButton("Edit", `Edit key ${i}`);
+      edit.onclick = () => {
+        if (!editing) {
+          editing = true;
+          input.readOnly = false;
+          input.type = "password";
+          input.value = "";
+          input.placeholder = "new key";
+          edit.textContent = "Save";
+          reveal.style.opacity = ".45";
+          reveal.disabled = true;
+          input.focus();
+          return;
+        }
+        const v = input.value.trim();
+        if (!v) { finishEdit(); return; }
+        saveKeys({ set: i, key: v });
+      };
+      input.onkeydown = (e) => {
+        if (!editing) return;
+        if (e.key === "Enter") { e.preventDefault(); edit.onclick(); }
+        if (e.key === "Escape") { e.preventDefault(); finishEdit(); }
+      };
+
+      // Pin the routed session to this key: its requests then follow this key's
+      // windows, which is how two sessions double the available capacity.
+      const sid = sessionId();
+      const isPinned = !!sid && Number(pins[sid]) === i;
+      const pinCell = keyButton(isPinned ? "Pinned" : "Pin",
+        sid ? `Use key ${i} for this session` : "Open a session first",
+        isPinned ? "border:1px solid rgba(120,200,140,.65);background:rgba(120,200,140,.16)" : "");
+      pinCell.disabled = !sid;
+      pinCell.style.opacity = sid ? "1" : ".45";
+      pinCell.style.cursor = sid ? "pointer" : "default";
+      pinCell.onclick = () => {
+        const id = sessionId();
+        if (id) saveKeys({ pin: { session: id, key: i } });
+      };
+
+      const delCell = keyButton("×", `Remove key ${i}`, "padding:0");
+      delCell.onclick = () => saveKeys({ remove: i });
+
+      row.appendChild(input);
+      row.appendChild(reveal);
+      row.appendChild(edit);
+      row.appendChild(pinCell);
+      row.appendChild(delCell);
+      keyList.appendChild(row);
+    });
+  }
+
+  // Add row at the bottom: one field, one button.
+  const addRow = document.createElement("div");
+  addRow.style.cssText = "display:grid;grid-template-columns:minmax(0,1fr) 58px;gap:6px;align-items:center;margin-top:4px";
+  const addInput = document.createElement("input");
+  addInput.type = "password";
+  addInput.autocomplete = "off";
+  addInput.spellcheck = false;
+  addInput.placeholder = "paste a key to add…";
+  addInput.style.cssText = keyCss.field;
+  const addBtn = keyButton("Add", "Add a key");
+  const doAdd = () => {
+    const v = addInput.value.trim();
+    if (!v) return;
+    addInput.value = "";
+    saveKeys({ add: v });
+  };
+  addBtn.onclick = doAdd;
+  addInput.onkeydown = (e) => {
+    if (e.key === "Enter") { e.preventDefault(); doAdd(); }
+  };
+  addRow.appendChild(addInput);
+  addRow.appendChild(addBtn);
+  keyBox.appendChild(addRow);
+
+  // Saves never touch the add field or the rows' edit state: they only update the
+  // key list, pins, and the note.
+  async function saveKeys(payload) {
+    try {
+      const r = await fetch(keysUrl, { method: "POST", cache: "no-store", body: JSON.stringify(payload) });
+      const j = await r.json();
+      if (!r.ok) throw new Error(j.error || "HTTP " + r.status);
+      keys = j.keys || [];
+      pins = j.pins || {};
+      keySig = JSON.stringify([keys, pins, sessionId()]);
+      renderKeys();
+      keyNote.textContent = "saved to keys.json - each session sticks to one key";
+    } catch (e) {
+      keyNote.textContent = "key update failed: " + ((e && e.message) || "unreachable");
+    }
+  }
+
+  renderKeys();
+
+  let data = null;
+  let error = null;
+  // Live slot usage per model: used requests in the current window vs the cap.
+  let slots = {};
+  // model -> { count, from[] } for overflow traffic in flight (from /status).
+  let overflowActive = {};
+
+  function slotCell(el, name) {
+    const s = slots[name];
+    if (!s || !s.max) return el;
+    const used = Math.min(s.used || 0, s.max);
+    const width = Math.max(2, String(s.max).length);
+    const pad = (n) => String(n).padStart(width, "0");
+
+    const tag = document.createElement("span");
+    tag.textContent = `[${pad(used)}/${pad(s.max)}] `;
+    tag.style.cssText = used >= s.max
+      ? "opacity:.95;font-weight:650;font-variant-numeric:tabular-nums"
+      : "opacity:.5;font-variant-numeric:tabular-nums";
+    tag.title = `${used} of ${s.max} requests in the window` +
+      (s.tokenMax ? ` · ${fmt(s.tokensUsed || 0)} of ${fmt(s.tokenMax)} tokens (${(((s.tokensUsed || 0) / s.tokenMax) * 100).toFixed(1)}%)` : "");
+
+    // `*` while this model is serving requests that overflowed from another one.
+    const spill = overflowActive[name];
+    const label = document.createElement("span");
+    label.textContent = displayModel(name) + (spill ? ` *${spill.count}` : "");
+    label.title = name; // the API id on hover
+    if (spill) {
+      label.title = `${spill.count} of the used slots in the last minute came from ${spill.from.join(", ")} overflowing here` +
+        (spill.inFlight ? ` (${spill.inFlight} still running)` : "");
+    }
+
+    el.textContent = "";
+    el.appendChild(tag);
+    el.appendChild(label);
+    return el;
+  }
+
+  function th(text, align, title) {
+    const el = document.createElement("th");
+    el.textContent = text;
+    el.style.cssText = [
+      "text-align:" + align,
+      "padding:6px 8px",
+      "border-bottom:1px solid rgba(127,127,127,.28)",
+      "font-weight:600",
+      "font-size:11px",
+      "opacity:.6",
+      "white-space:nowrap",
+      title ? "cursor:help" : "",
+    ].join(";");
+    if (title) el.title = title;
+    return el;
+  }
+
+  function td(text, align, opts = {}) {
+    const el = document.createElement("td");
+    el.textContent = text;
+    el.style.cssText = [
+      "text-align:" + align,
+      "padding:6px 8px",
+      "border-bottom:" + (opts.last ? "none" : BORDER),
+      "white-space:nowrap",
+      opts.strong ? "font-weight:650" : "",
+      opts.muted ? "opacity:.6" : "",
+      opts.model ? "max-width:190px;overflow:hidden;text-overflow:ellipsis" : "",
+    ].join(";");
+    if (opts.model) el.title = text;
+    if (opts.title) el.title = opts.title;
+    return el;
+  }
+
+  function paint() {
+    for (const [k, b] of Object.entries(buttons)) {
+      b.style.background = k === win ? "rgba(127,127,127,.22)" : "transparent";
+      b.style.fontWeight = k === win ? "650" : "400";
+    }
+
+    table.textContent = "";
+    if (error) {
+      for (const v of Object.values(cardValues)) v.textContent = "—";
+      footer.textContent = "";
+      const row = document.createElement("div");
+      row.textContent = "proxy offline: " + error;
+      row.style.cssText = "opacity:.7;padding:8px 0";
+      table.appendChild(row);
+      return;
+    }
+    if (!data) {
+      cardValues.requests.textContent = "…";
+      return;
+    }
+
+    renderKeyFilter();
+    // "all keys" is the combined window; a key shows only what ran on that key.
+    const perKey = keyView !== "all" && data.perKey && data.perKey[win] && data.perKey[win][keyView];
+    const w = keyView === "all"
+      ? data.windows && data.windows[win]
+      : (perKey ? perKey.total : { requests: 0, input: 0, output: 0, reasoning: 0, cached: 0, cost: 0 });
+    if (!w) { footer.textContent = "no data yet for " + win; return; }
+
+    cardValues.requests.textContent = String(w.requests);
+    cardValues.input.textContent = fmt(w.input);
+    cardValues.output.textContent = fmt(w.output);
+    cardValues.cost.textContent = money(w.cost);
+
+    const thead = document.createElement("thead");
+    const hr = document.createElement("tr");
+    for (const c of COLUMNS) hr.appendChild(th(c.label, c.align, c.title));
+    thead.appendChild(hr);
+    table.appendChild(thead);
+
+    const body = document.createElement("tbody");
+    // Every model the proxy knows a price for gets a row, so a model that has not
+    // been used in this window still shows up (with zeros) instead of being absent.
+    // Only models the proxy still offers get a row. A retired model (one the
+    // gateway no longer lists) has no price entry, so its history is not shown here.
+    const offered = data.pricing ? new Set(Object.keys(data.pricing)) : null;
+    const models = {};
+    const rowsSrc = keyView === "all" ? ((data.models && data.models[win]) || {}) : (perKey ? perKey.models : {});
+    for (const [name, m] of Object.entries(rowsSrc)) {
+      if (!offered || offered.has(name)) models[name] = m;
+    }
+    for (const name of offered || []) {
+      if (!models[name]) models[name] = { requests: 0, input: 0, output: 0, reasoning: 0, cost: 0 };
+    }
+    const rows = Object.entries(models).sort((a, b) => (b[1].cost || 0) - (a[1].cost || 0) || (b[1].output || 0) - (a[1].output || 0));
+    for (const [name, m] of rows) {
+      const tr = document.createElement("tr");
+      // Model cell tooltip: the API id plus the rates used for the cost column.
+      const p = (data.pricing || {})[name];
+      const priceTitle = p
+        ? [name, `input $${p.in}/Mtok · output $${p.out}/Mtok · cached $${p.cached}/Mtok`,
+           m.ttftMs || m.tpsN ? "" : null].filter(Boolean).join("\n")
+        : name;
+      tr.appendChild(slotCell(td(displayModel(name), "left", { model: true, title: priceTitle }), name));
+      tr.appendChild(td(String(m.requests), "right"));
+      tr.appendChild(td(fmt(m.input), "right"));
+      tr.appendChild(td(fmt(m.output), "right"));
+      tr.appendChild(td(fmt(m.reasoning), "right"));
+      tr.appendChild(td(cachedPct(m.cachedReal, m.inputReal), "right", { title: cachedTitle(m.cachedReal, m.inputReal) }));
+      tr.appendChild(td(m.avgTps ? String(m.avgTps) : "—", "right", { muted: !m.avgTps, title: tpsTitle(m) }));
+      tr.appendChild(td(secs(m.ttftMs), "right", { muted: !m.ttftMs, title: ttftTitle(m) }));
+      tr.appendChild(td(secs(m.avgMs), "right", { muted: !m.avgMs }));
+      tr.appendChild(td(money(m.cost), "right"));
+      body.appendChild(tr);
+    }
+    table.appendChild(body);
+
+    // totals
+    const tfoot = document.createElement("tfoot");
+    const tr = document.createElement("tr");
+    tr.style.background = "rgba(127,127,127,.06)";
+    const sumReq = rows.reduce((n, [, m]) => n + (m.requests || 0), 0);
+    tr.appendChild(td("Total", "left", { strong: true, last: true }));
+    tr.appendChild(td(String(sumReq), "right", { strong: true, last: true }));
+    tr.appendChild(td(fmt(w.input), "right", { strong: true, last: true }));
+    tr.appendChild(td(fmt(w.output), "right", { strong: true, last: true }));
+    tr.appendChild(td(fmt(w.reasoning), "right", { strong: true, last: true }));
+    tr.appendChild(td(cachedPct(w.cachedReal, w.inputReal), "right", { strong: true, last: true, title: cachedTitle(w.cachedReal, w.inputReal) }));
+    tr.appendChild(td(w.avgTps ? String(w.avgTps) : "—", "right", { strong: true, last: true, title: tpsTitle(w) }));
+    tr.appendChild(td(secs(w.ttftMs), "right", { strong: true, last: true, title: ttftTitle(w) }));
+    tr.appendChild(td(secs(w.avgMs), "right", { strong: true, last: true }));
+    tr.appendChild(td(money(w.cost), "right", { strong: true, last: true }));
+    tfoot.appendChild(tr);
+    table.appendChild(tfoot);
+
+    footer.textContent =
+      `auto ${Math.round(refreshMs / 1000)}s · updated ${new Date(data.updated || Date.now()).toLocaleTimeString()}` +
+      (w.seeded ? ` · ${w.seeded} imported` : "");
+  }
+
+  const born = Date.now();
+  let inFlight = false;
+  async function refresh() {
+    if (!root.isConnected && Date.now() - born > 15000) { clearInterval(timer); return; }
+    if (inFlight) return;
+    inFlight = true;
+    refreshBtn.style.opacity = ".45";
+    refreshBtn.textContent = "…";
+    try {
+      const [usageRes, statusRes, keysRes] = await Promise.all([
+        fetch(endpoint, { cache: "no-store" }),
+        fetch(endpoint.replace(/\/usage\/?$/, "/status"), { cache: "no-store" }).catch(() => null),
+        fetch(keysUrl, { cache: "no-store" }).catch(() => null),
+      ]);
+      if (!usageRes.ok) throw new Error("HTTP " + usageRes.status);
+      data = await usageRes.json();
+      error = null;
+      if (keysRes && keysRes.ok) {
+        const kj = await keysRes.json();
+        if (Array.isArray(kj.sessions)) {
+          sessions = kj.sessions;
+          renderSessions();
+        }
+        if (Array.isArray(kj.keys)) {
+          keys = kj.keys;
+          pins = kj.pins || {};
+          // Re-render only when something the rows show has changed, so an open
+          // Edit is not rebuilt by the 5-second poll.
+          const sig = JSON.stringify([keys, pins, sessionId()]);
+          if (sig !== keySig) {
+            keySig = sig;
+            renderKeys();
+          }
+        }
+      }
+
+      // Slot usage for the model column: live limiter state, plus the configured
+      // caps so a model with no traffic yet still shows "0/6".
+      slots = {};
+      overflowActive = {};
+      if (statusRes && statusRes.ok) {
+        const s = await statusRes.json();
+        overflowActive = (s.overflow && s.overflow.active) || {};
+        for (const [name, v] of Object.entries(s.models || {})) {
+          slots[name] = { used: v.used || 0, max: v.max || 0, tokensUsed: v.tokensUsed || 0, tokenMax: v.tokenMax || 0 };
+        }
+        // Models with no traffic yet have no live limiter: take both caps from the
+        // configured limits so every row shows its request and token ceiling.
+        const tokenCap = (name) => {
+          const t = /^(\d+)\//.exec(String((s.tokenLimits || {})[name] || ""));
+          return t ? Number(t[1]) : 0;
+        };
+        for (const [name, spec] of Object.entries(s.limits || {})) {
+          const m = /^(\d+)\//.exec(String(spec));
+          if (m && !slots[name]) slots[name] = { used: 0, max: Number(m[1]), tokensUsed: 0, tokenMax: tokenCap(name) };
+        }
+        for (const [name, v] of Object.entries(slots)) {
+          if (!v.tokenMax) v.tokenMax = tokenCap(name);
+        }
+      }
+    } catch (e) {
+      error = (e && e.message) || "unreachable";
+      slots = {};
+    } finally {
+      inFlight = false;
+      refreshBtn.style.opacity = "1";
+      refreshBtn.textContent = "↻";
+    }
+    paint();
+  }
+
+  const timer = setInterval(refresh, refreshMs);
+  paint();
+  refresh();
+  return root;
+}
+
+module.exports = {
+  default: Plugin.define({
+    i18n: { en: { title: "Prism usage", heading: "Usage" } },
+    setup(ctx) {
+      const endpoint = (ctx.options && ctx.options.usageEndpoint) || "http://127.0.0.1:17334/usage";
+      const refreshMs = Math.max(1000, Number(ctx.options && ctx.options.refreshMs) || 5000);
+      const key = `${ctx.id}:usage`;
+      const statusUrl = endpoint.replace(/\/usage\/?$/, "/status");
+
+      // Proxy retry state for the pill: poll /status once a second.
+      const statusTimer = setInterval(async () => {
+        try {
+          const r = await fetch(statusUrl, { cache: "no-store" });
+          setProxyStatus(r.ok ? await r.json() : null);
+        } catch {
+          setProxyStatus(null);
+        }
+      }, 1000);
+
+      // Composer pill, the working timer: elapsed time for the routed session,
+      // plus the proxy's retry state when it is re-sending a request.
+      const tickTimer = setInterval(() => setTick((n) => n + 1), 1000);
+
+      ctx.add(ComposerPill, {
+        id: "working",
+        order: 5,
+        show: (input) => {
+          tick();
+          const seconds = elapsedSeconds(input.session);
+          if (seconds === null) return undefined;
+          const s = proxyStatus();
+          const e = s && s.sessions && input.session ? s.sessions[input.session.id] : null;
+          const suffix = e ? ` · retrying ${e.retries} · HTTP ${e.status}` : "";
+          return {
+            label: `Working (${formatSeconds(seconds)}${suffix})`,
+            icon: "status",
+            tone: e ? "warning" : undefined,
+            title: e
+              ? `${e.model || "request"} returned ${e.status}; the proxy is retrying`
+              : "Session is running",
+          };
+        },
+      });
+
+      const tab = {
+        id: "usage",
+        get title() { return ctx.t("title"); },
+        closable: "compact",
+        fallback: true,
+      };
+
+      const open = () => {
+        const session = ctx.sessions.current();
+        if (session) ctx.layout.open(key, session);
+      };
+
+      ctx.add(Panel, {
+        id: "usage",
+        region: "side",
+        width: "narrow",
+        mobile: {
+          get title() { return ctx.t("title"); },
+          order: 40,
+          kind: "menu",
+          icon: "status",
+          cached: true,
+        },
+        list: (input) => (input.open.includes("usage") ? [tab] : []),
+        render: () => buildPanel(endpoint, refreshMs, ctx.t("heading"), () => {
+          const s = ctx.sessions && ctx.sessions.current ? ctx.sessions.current() : null;
+          return s && s.id ? s.id : null;
+        }, (id) => {
+          // The title comes from the app's own session data, which knows every
+          // session the server has, not just the one on screen.
+          const s = ctx.sessions && ctx.sessions.current ? ctx.sessions.current() : null;
+          const info = s && s.server && s.server.data && s.server.data.session && s.server.data.session.get(id);
+          return (info && (info.title || info.name)) || null;
+        }),
+      });
+
+      ctx.add(MenuItem, () => ({
+        menu: "session.panel",
+        id: "usage",
+        title: ctx.t("title"),
+        icon: "status",
+        description: "tokens · cost · tps",
+        run: open,
+      }));
+
+      ctx.add(Command, () => ({
+        id: "usage",
+        title: ctx.t("title"),
+        section: "navigation",
+        run: open,
+      }));
+
+      return () => {
+        clearInterval(statusTimer);
+        clearInterval(tickTimer);
+      };
+    },
+  }),
+};

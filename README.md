@@ -141,9 +141,28 @@ Costs are list-price estimates, not what PrismRouter bills.
 | `PRISM_PROXY_PING_TIMEOUT_MS` | `30000` | hard limit for one ping |
 | `PRISM_PROXY_PING_WAIT_MS` | `180000` | slot wait for a ping |
 
+## Desktop sidebar panel
+
+`desktop-usage-panel/` adds a **Prism usage** tab to the session side region:
+summary cards, one row per model, a 24u / 24h / 7d / 30d / all switch, a refresh
+button, and a working composer pill. It reads `/usage` and `/status` from the
+proxy on `127.0.0.1:17334`.
+
+Install it next to the proxy plugin:
+
+```sh
+cp -r desktop-usage-panel ~/.config/opencode/plugins/prism-usage
+opencode reload
+```
+
+Restart the desktop window after copying; the GUI bundle is read when a window
+starts. Options when the plugin is listed in `opencode.jsonc`: `refreshMs` and
+`usageEndpoint`.
+
 ## Files
 
 - `index.js` - proxy, limiter, key pool, usage accounting
+- `desktop-usage-panel/` - optional OpenCode Desktop sidebar panel
 - `opencode.prism.json` - OpenCode provider block
 - `keys.json.example` - placeholder key file
 - `keys.json` - real key, git-ignored
