@@ -36,15 +36,16 @@ async function startProxy(t, handler) {
   return `http://127.0.0.1:${port}`;
 }
 
-test("Responses retries a gateway 502 before delivering a single stream", { timeout: 15000 }, async (t) => {
+test("Responses waits past the former 502 retry limit and delivers a single stream", { timeout: 15000 }, async (t) => {
   const requests = [];
+  const failures = 7;
   const stream = 'event: response.completed\ndata: {"type":"response.completed","response":{"usage":{"input_tokens":8,"output_tokens":1}}}\n\n';
   const base = await startProxy(t, async (req, res) => {
     const chunks = [];
     for await (const chunk of req) chunks.push(chunk);
     requests.push({ url: req.url, body: Buffer.concat(chunks).toString() });
-    if (requests.length === 1) res.writeHead(502, { "content-type": "text/html" }).end("Bad Gateway");
-    else if (requests.length === 2) res.writeHead(200, { "content-type": "text/event-stream" }).end(stream);
+    if (requests.length <= failures) res.writeHead(502, { "content-type": "text/html", "retry-after": "1" }).end("Bad Gateway");
+    else if (requests.length === failures + 1) res.writeHead(200, { "content-type": "text/event-stream" }).end(stream);
     else res.writeHead(400, { "content-type": "application/json" }).end('{"error":"invalid input"}');
   });
   const body = JSON.stringify({ model: "gpt-6.2-astra", input: "ping", stream: true });
@@ -52,14 +53,68 @@ test("Responses retries a gateway 502 before delivering a single stream", { time
   const reply = await post();
   assert.equal(reply.status, 200);
   assert.equal(await reply.text(), stream);
-  assert.deepEqual(requests, Array(2).fill({ url: "/doway/v1/responses", body }));
+  assert.deepEqual(requests, Array(failures + 1).fill({ url: "/doway/v1/responses", body }));
   const status = await (await fetch(`${base}/status`)).json();
-  assert.equal(status.global["global|1"].total, 2);
-  assert.equal(status.retries5xx, 1);
+  assert.equal(status.global["global|1"].total, failures + 1);
+  assert.equal(status.retries5xx, failures);
   const rejected = await post();
   assert.equal(rejected.status, 400);
   assert.deepEqual(await rejected.json(), { error: "invalid input" });
-  assert.equal(requests.length, 3);
+  assert.equal(requests.length, failures + 2);
+});
+
+test("Canceling a request awaiting gateway recovery clears its retry state", { timeout: 10000 }, async (t) => {
+  let attempts = 0;
+  const base = await startProxy(t, (req, res) => {
+    req.resume();
+    attempts++;
+    res.writeHead(502, { "retry-after": "10" }).end("Bad Gateway");
+  });
+  const controller = new AbortController();
+  const post = fetch(`${base}/v1/responses`, {
+    method: "POST",
+    headers: { "content-type": "application/json", "x-opencode-session-id": "ses_cancel" },
+    body: JSON.stringify({ model: "gpt-6.2-astra", input: "hello", stream: true }),
+    signal: controller.signal,
+  });
+  const aborted = assert.rejects(post, { name: "AbortError" });
+  let status;
+  for (let i = 0; i < 40; i++) {
+    status = await (await fetch(`${base}/status`)).json();
+    if (status.sessions.ses_cancel?.status === 502) break;
+    await new Promise(resolve => setTimeout(resolve, 15));
+  }
+  assert.equal(status.sessions.ses_cancel?.status, 502);
+  controller.abort();
+  await aborted;
+  for (let i = 0; i < 40; i++) {
+    status = await (await fetch(`${base}/status`)).json();
+    if (status.active === 0) break;
+    await new Promise(resolve => setTimeout(resolve, 15));
+  }
+  assert.equal(status.active, 0);
+  assert.equal(status.sessions.ses_cancel, undefined);
+  assert.equal(attempts, 1);
+});
+
+test("Compaction waits out upstream 502s on the original and handoff models", { timeout: 10000 }, async (t) => {
+  const called = [];
+  const base = await startProxy(t, async (req, res) => {
+    const { model } = await new Response(req).json();
+    called.push(model);
+    if (called.length === 1 || called.length === 3) return res.writeHead(502).end("Bad Gateway");
+    if (called.length === 2) return res.writeHead(400).end('{"error":"Refused"}');
+    res.writeHead(200, { "content-type": "application/json" }).end('{"choices":[{"finish_reason":"stop"}]}');
+  });
+  const body = { model: "gpt-6.2-astra", messages: [{ role: "user", content: "x".repeat(21000) }] };
+  const result = await fetch(`${base}/v1/chat/completions`, {
+    method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body),
+  });
+  assert.equal(result.status, 200);
+  assert.equal((await result.json()).choices[0].finish_reason, "stop");
+  assert.deepEqual(called, ["gpt-6.2-astra", "gpt-6.2-astra", "gpt-6.2-sol", "gpt-6.2-sol"]);
+  const status = await (await fetch(`${base}/status`)).json();
+  assert.equal(status.global["global|1"].total, called.length);
 });
 
 test("Root aliases use their native APIs, the pooled key, and the shared usage window", { timeout: 15000 }, async (t) => {

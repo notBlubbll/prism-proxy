@@ -20,6 +20,7 @@
 import { createServer, request as httpRequest } from "node:http";
 import { request as httpsRequest } from "node:https";
 import { createInterface } from "node:readline";
+import { setTimeout as delay } from "node:timers/promises";
 import { createHash } from "node:crypto";
 import zlib from "node:zlib";
 import fs from "node:fs";
@@ -200,7 +201,7 @@ function recordCost(r) {
 
 // Retries after an upstream 429 before the 429 is handed to the client.
 const MAX_429_RETRIES = 6;
-// Retries for transient 5xx (502/503/504/520/522/524) before giving up.
+// Retry budget for failures other than an upstream HTTP 502.
 const MAX_5XX_RETRIES = 5;
 // Wall-clock ceiling for 429 waits on a single request.
 const RATE_LIMIT_BUDGET_MS = Number(process.env.PRISM_PROXY_RL_BUDGET_MS) || 10 * 60 * 1000;
@@ -518,6 +519,11 @@ function log(msg) {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, Math.max(0, ms)));
 
+async function waitForRetry(ms, signal) {
+  try { await delay(ms, undefined, { signal }); }
+  catch (err) { if (!signal?.aborted) throw err; }
+}
+
 // ---- limit parsing ---------------------------------------------------------
 
 function parseWindow(spec) {
@@ -711,7 +717,7 @@ function hasLimiter(model, slot = 0) {
 // With `maxWaitMs`, a caller gives up its place instead of waiting longer than
 // that and resolves `{ spill: true }` without reserving anything, so the caller
 // can send the request somewhere else (see the overflow rules below).
-function acquireLimiter(lim, label, estTokens = 0, maxWaitMs = 0) {
+function acquireLimiter(lim, label, estTokens = 0, maxWaitMs = 0, signal) {
   if (!lim) return Promise.resolve(null);
   const calledAt = Date.now();
   let cancelled = false;
@@ -719,6 +725,7 @@ function acquireLimiter(lim, label, estTokens = 0, maxWaitMs = 0) {
     if (cancelled) return { spill: true };
     const start = Date.now();
     for (;;) {
+      if (signal?.aborted) return null;
       if (cancelled) return { spill: true };
       const now = Date.now();
       const wait = lim.waitTime(now, estTokens);
@@ -738,7 +745,7 @@ function acquireLimiter(lim, label, estTokens = 0, maxWaitMs = 0) {
         }
         return { limiter: lim, entry };
       }
-      await sleep(Math.min(wait, 1000));
+      await waitForRetry(Math.min(wait, 1000), signal);
     }
   });
   lim.tail = run.catch(() => {});
@@ -754,14 +761,16 @@ function acquireLimiter(lim, label, estTokens = 0, maxWaitMs = 0) {
 // Every request takes a slot in the key's global window first, then in its
 // per-model window when one is configured. The returned reservation keeps both
 // entries so usage reconciliation updates both budgets.
-function acquire(model, estTokens = 0, maxWaitMs = 0, slot = 0) {
+function acquire(model, estTokens = 0, maxWaitMs = 0, slot = 0, signal) {
   const global = globalLimiterFor(slot);
   const modelLim = limiterFor(model, slot);
   if (!global && !modelLim) return Promise.resolve(null);
   return (async () => {
-    const globalRes = await acquireLimiter(global, "global", estTokens, maxWaitMs);
+    const globalRes = await acquireLimiter(global, "global", estTokens, maxWaitMs, signal);
+    if (signal?.aborted) return null;
     if (globalRes && globalRes.spill) return globalRes;
-    const modelRes = await acquireLimiter(modelLim, model, estTokens, maxWaitMs);
+    const modelRes = await acquireLimiter(modelLim, model, estTokens, maxWaitMs, signal);
+    if (signal?.aborted) return null;
     if (modelRes && modelRes.spill) return modelRes;
     return {
       limiter: global || modelLim,
@@ -1398,6 +1407,7 @@ function upstreamRequest(target, opts) {
     method: opts.method,
     headers: opts.headers,
     agent: false,
+    signal: opts.signal,
   });
 }
 
@@ -1485,6 +1495,16 @@ function parseRetryAfterMs(headers) {
   const when = Date.parse(raw);
   if (Number.isFinite(when)) return Math.max(0, when - Date.now());
   return null;
+}
+
+async function waitForBadGateway(model, count, headers, signal, sessionId) {
+  const backoff = Math.min(500 * 2 ** Math.min(count - 1, 5), 15000);
+  const retryAfter = parseRetryAfterMs(headers);
+  const wait = retryAfter > 0 ? Math.min(RETRY_AFTER_CAP_MS, Math.max(500, retryAfter)) : backoff;
+  PROXY_STATE.retries5xx = (PROXY_STATE.retries5xx || 0) + 1;
+  noteSessionRetry(sessionId, 502, model);
+  log(`upstream 502 for ${model}; retrying in ${wait / 1000}s (gateway retry ${count})`);
+  await waitForRetry(wait, signal);
 }
 
 // Learn the limit from the gateway's own error text, e.g.
@@ -1745,6 +1765,10 @@ async function handle(req, res) {
   }
 
   let body = await readBody(req);
+  if (res.destroyed) return;
+  const abort = new AbortController();
+  const { signal } = abort;
+  res.once("close", () => { if (!res.writableEnded) abort.abort(); });
   let meta = readRequest(body);
   let model = meta.model;
   const isChat = url.pathname.includes("/chat/completions");
@@ -1801,11 +1825,8 @@ async function handle(req, res) {
     // so it does not compete for the per-minute window, then run it with a
     // fallback model if the provider blocks the summary.
     if (isChat && model && looksLikeCompaction(meta)) {
-      await deferWhileBusy(model);
-      const finished = await runCompaction(req, res, url, body, model, keySlot);
-      if (finished) return;
-      meta = readRequest(body);
-      model = meta.model || model;
+      await deferWhileBusy(model, signal);
+      return await runCompaction(req, res, url, body, model, keySlot, signal);
     }
 
     let estTokens = estimateTokens(body, meta.maxTokens);
@@ -1838,18 +1859,18 @@ async function handle(req, res) {
     const reqJson = isChat && VISION_ENABLED ? readRequest(body).json : null;
     let imageFallback = !!reqJson && model !== VISION_MODEL && collectImageParts(reqJson).length > 0;
 
-    const maxAttempts = 1 + MAX_429_RETRIES + MAX_5XX_RETRIES + Number(imageFallback);
+    const textRequest = isChat || isResponses || isMessages;
+    let gatewayAttempts = 0;
     let serverAttempts = 0;
     let rateAttempts = 0;
     const budgetStart = Date.now();
     const reserveAttempt = async (maxWaitMs) => {
       PROXY_STATE.queued++;
-      try { return await acquire(model, estTokens, maxWaitMs, keySlot); } finally { PROXY_STATE.queued--; }
+      try { return await acquire(model, estTokens, maxWaitMs, keySlot, signal); } finally { PROXY_STATE.queued--; }
     };
-    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-      if (res.destroyed || res.writableEnded) return;
-      if ((isChat || isResponses || isMessages || isImage) && model && hasLimiter(model, keySlot)) {
-        const rule = !spilledFrom && OVERFLOW.get(model);
+    while (!signal.aborted && !res.writableEnded) {
+      if ((textRequest || isImage) && model && hasLimiter(model, keySlot)) {
+        const rule = !gatewayAttempts && !spilledFrom && OVERFLOW.get(model);
         reservation = await reserveAttempt(rule ? rule.maxWaitMs : 0);
         if (reservation?.spill) {
           spillOver(`a slot would take over ${rule.maxWaitMs / 1000}s`);
@@ -1857,14 +1878,21 @@ async function handle(req, res) {
         }
         noteSessionSlot(sessionAct, model, reservation);
       }
-      if (res.destroyed || res.writableEnded) return;
+      if (signal.aborted || res.writableEnded) return;
       const result = await forward(req, res, url, body, model, isChat, {
         headers: spilledFrom ? { "x-prism-overflow": `${spilledFrom}->${model}` } : {},
         imageFallback,
-        retry5xx: isChat || isResponses || isMessages,
+        retry5xx: textRequest,
+        signal,
         isMessages, isImage,
-        retry429: !!model && (isChat || isResponses || isMessages || isImage),
+        retry429: !!model && (textRequest || isImage),
       });
+      if (signal.aborted) return;
+      if (result.gatewayError) {
+        await waitForBadGateway(model, ++gatewayAttempts, result.headers, signal, sessionId);
+        continue;
+      }
+      gatewayAttempts = 0;
       if (result.done) {
         const tokens = recordUsage(model, result, Date.now() - started, keySlot, isImage);
         const measured = tokens ?? estTokens + Math.ceil((isImage ? 0 : result.bytes || 0) / 4);
@@ -1889,19 +1917,19 @@ async function handle(req, res) {
         PROXY_STATE.retries5xx = (PROXY_STATE.retries5xx || 0) + 1;
         noteSessionRetry(sessionId, result.status, model);
         const refused = result.text?.includes("upstream_rejected_request") || result.text?.includes("Provider returned error");
-        if (attemptNo > MAX_5XX_RETRIES || attempt === maxAttempts || refused || Date.now() - budgetStart > RATE_LIMIT_BUDGET_MS) {
+        if (attemptNo > MAX_5XX_RETRIES || refused || Date.now() - budgetStart > RATE_LIMIT_BUDGET_MS) {
           log(`upstream ${result.status} for ${model} after ${attemptNo - 1} retries${refused ? " (provider refused the body)" : ""}; forwarding it (${body.length} bytes)`);
           clearSessionRetry(sessionId);
           return sendJson(res, result.status, result.text);
         }
         const wait = Math.min(500 * 2 ** (attemptNo - 1), 15000);
         log(`upstream ${result.status} for ${model} (${body.length} bytes); retrying in ${wait / 1000}s (attempt ${attemptNo}/${MAX_5XX_RETRIES})`);
-        await sleep(wait);
+        await waitForRetry(wait, signal);
         continue;
       }
       const { retryMs, keyWide } = learnFrom429(model, result.headers, result.text, keySlot);
       reconcileTokens(reservation, 0, 0);
-      if (++rateAttempts > MAX_429_RETRIES || attempt === maxAttempts || Date.now() - budgetStart + retryMs > RATE_LIMIT_BUDGET_MS) {
+      if (++rateAttempts > MAX_429_RETRIES || Date.now() - budgetStart + retryMs > RATE_LIMIT_BUDGET_MS) {
         log(`429 budget exhausted for ${model}, forwarding the 429`);
         const retryAfter = result.headers["retry-after"] || String(Math.ceil(retryMs / 1000));
         return sendJson(res, result.status, result.text, { "retry-after": retryAfter });
@@ -1913,8 +1941,8 @@ async function handle(req, res) {
         spillOver(`upstream 429, retry in ${Math.round(retryMs / 1000)}s`);
         continue;
       }
-      log(`upstream 429 for ${model}; waiting ${Math.round(retryMs / 1000)}s (attempt ${attempt}/${maxAttempts})`);
-      await sleep(retryMs);
+      log(`upstream 429 for ${model}; waiting ${Math.round(retryMs / 1000)}s (retry ${rateAttempts}/${MAX_429_RETRIES})`);
+      await waitForRetry(retryMs, signal);
     }
   } finally {
     if (spill) clearOverflowActive(spill.target, spill.from);
@@ -1947,7 +1975,7 @@ function forward(req, res, url, body, model, isChat, opts = {}) {
 
     let up;
     try {
-      up = upstreamRequest(targetUrl(url.pathname + url.search, model), { method: req.method, headers });
+      up = upstreamRequest(targetUrl(url.pathname + url.search, model), { method: req.method, headers, signal: opts.signal });
     } catch (err) {
       log(`upstream request failed: ${err?.message || err}`);
       send(res, 502, "text/plain", `prism-proxy: ${err?.message || err}\n`);
@@ -1955,6 +1983,8 @@ function forward(req, res, url, body, model, isChat, opts = {}) {
     }
 
     up.on("error", (err) => {
+      if (settled) return;
+      if (opts.signal?.aborted) return finish({ done: true });
       if (res.headersSent) { try { res.end(); } catch {} return finish({ done: true }); }
       log(`upstream error: ${err?.message || err}`);
       send(res, 502, "text/plain", `prism-proxy upstream error: ${err?.message || err}\n`);
@@ -1963,6 +1993,11 @@ function forward(req, res, url, body, model, isChat, opts = {}) {
 
     up.on("response", (rawRes) => {
       const status = rawRes.statusCode || 502;
+      if (status === 502 && opts.retry5xx) {
+        finish({ gatewayError: true, headers: rawRes.headers });
+        rawRes.destroy();
+        return;
+      }
       // We ask for identity, but the gateway may still compress a reply. Decode it
       // here: the client gets plain bytes and the headers stay consistent with them.
       // Passing compressed bytes with a content-encoding header, or decoding them as
@@ -2051,7 +2086,7 @@ function forward(req, res, url, body, model, isChat, opts = {}) {
         // Always leave a trace of a non-2xx: this is what makes a failed turn
         // attributable instead of an opaque "blocked by the provider".
         const ct = String(hdrs["content-type"] || "");
-        const retryable = opts.retry5xx && (isChat ? status >= 500 : [502, 503, 504, 520, 522, 524].includes(status));
+        const retryable = opts.retry5xx && (isChat ? status >= 500 : [503, 504, 520, 522, 524].includes(status));
         const throttled = status === 429 && opts.retry429;
         if (throttled || retryable || !ct.includes("event-stream")) {
           const chunks = [];
@@ -2097,12 +2132,6 @@ function forward(req, res, url, body, model, isChat, opts = {}) {
 
     function timing2() { return { sentAt, firstTokenAt, lastTokenAt, tokenFrames, sawReasoning }; }
 
-    res.on("close", () => {
-      if (!res.writableEnded) {
-        log(`client closed mid-stream model=${model || "-"} (upstream ${up.res?.statusCode || "pending"})`);
-        try { up.destroy(); } catch {}
-      }
-    });
     up.end(body);
   });
 }
@@ -2129,10 +2158,10 @@ function estimateTokens(body, maxOutput) {
 // Wait until no other request is in flight. The compaction request is the one
 // whose failure costs a whole turn, so it gets a quiet window instead of racing
 // long turns for the same per-minute budget.
-async function deferWhileBusy(model) {
+async function deferWhileBusy(model, signal) {
   const t0 = Date.now();
-  while (PROXY_STATE.active > 1) {
-    await sleep(250);
+  while (PROXY_STATE.active > 1 && !signal.aborted) {
+    await waitForRetry(250, signal);
     if (Date.now() - t0 > 120000) break; // never park a turn forever
   }
   const waited = Date.now() - t0;
@@ -2275,17 +2304,22 @@ function rewriteModel(body, model) {
 // One upstream attempt, fully buffered. Used only for compaction: the response
 // is small enough to hold, and we must see the finish reason before deciding to
 // forward it or hand off to the fallback model.
-function forwardBuffered(req, url, body, model) {
+function forwardBuffered(req, url, body, model, signal) {
   return new Promise((resolve) => {
     const headers = buildForwardHeaders(req.headers, body.length);
     let up;
     try {
-      up = upstreamRequest(targetUrl(url.pathname + url.search, model), { method: req.method, headers });
+      up = upstreamRequest(targetUrl(url.pathname + url.search, model), { method: req.method, headers, signal });
     } catch (err) {
       return resolve({ status: 502, headers: {}, text: `prism-proxy: ${err?.message || err}`, finish: null });
     }
     up.on("error", (err) => resolve({ status: 502, headers: {}, text: `prism-proxy upstream error: ${err?.message || err}`, finish: null }));
     up.on("response", (upRes) => {
+      if (upRes.statusCode === 502) {
+        resolve({ gatewayError: true, headers: upRes.headers });
+        upRes.destroy();
+        return;
+      }
       const chunks = [];
       let size = 0;
       upRes.on("data", (c) => { chunks.push(c); size += c.length; });
@@ -2343,10 +2377,8 @@ function writeBuffered(res, r) {
   } catch {}
 }
 
-// Runs one compaction request: quiet window, then the original model, then the
-// handoff model if the provider blocked it. Returns true when the client has
-// been answered.
-async function runCompaction(req, res, url, body, model, slot = 0) {
+// Runs compaction on the original model, then the handoff model if refused.
+async function runCompaction(req, res, url, body, model, slot, signal) {
   let estTokens = estimateTokens(body);
   // A compaction request can be larger than the model's context: the whole
   // conversation is sent to summarize. Trim it to the most recent messages
@@ -2360,55 +2392,62 @@ async function runCompaction(req, res, url, body, model, slot = 0) {
       estTokens = estimateTokens(body);
     }
   }
-  estTokens = estimateTokens(body, readRequest(body).maxTokens);
   const sessionId = req.headers["x-opencode-session-id"] || req.headers["x-opencode-session"];
+  const dispatch = async (target, payload) => {
+    const tokens = estimateTokens(payload, readRequest(payload).maxTokens);
+    let gatewayAttempts = 0;
+    while (!signal.aborted) {
+      let reservation = null;
+      if (hasLimiter(target, slot)) {
+        PROXY_STATE.queued++;
+        try { reservation = await acquire(target, tokens, 0, slot, signal); } finally { PROXY_STATE.queued--; }
+      }
+      if (signal.aborted) return null;
+      const r = await forwardBuffered(req, url, payload, target, signal);
+      if (signal.aborted) return null;
+      if (r.gatewayError) {
+        await waitForBadGateway(target, ++gatewayAttempts, r.headers, signal, sessionId);
+        continue;
+      }
+      reconcileTokens(reservation, r.status === 429 ? 0 : Math.max(tokens, usageTokens(r.text) || 0), 0);
+      return r;
+    }
+    return null;
+  };
 
   const budgetStart = Date.now();
   for (let attempt = 1; attempt <= MAX_429_RETRIES + 1; attempt++) {
-    if (res.destroyed) return true;
-    let reservation = null;
-    if (hasLimiter(model, slot)) {
-      PROXY_STATE.queued++;
-      try { reservation = await acquire(model, estTokens, 0, slot); } finally { PROXY_STATE.queued--; }
-    }
-    if (res.destroyed) return true;
-    const r = await forwardBuffered(req, url, body, model);
+    const r = await dispatch(model, body);
+    if (!r) return;
 
     if (r.status === 429) {
       const { retryMs } = learnFrom429(model, r.headers, r.text, slot);
-      reconcileTokens(reservation, 0, 0);
       if (attempt > MAX_429_RETRIES || Date.now() - budgetStart + retryMs > RATE_LIMIT_BUDGET_MS) {
         r.headers["retry-after"] ??= String(Math.ceil(retryMs / 1000));
         writeBuffered(res, r);
-        return true;
+        return;
       }
       PROXY_STATE.retries++;
       noteSessionRetry(sessionId, r.status, model);
       log(`upstream 429 for ${model} (compaction, key ${slot || "-"}); waiting ${Math.round(retryMs / 1000)}s (attempt ${attempt})`);
-      await sleep(retryMs);
+      await waitForRetry(retryMs, signal);
       continue;
     }
 
-    reconcileTokens(reservation, Math.max(estTokens, usageTokens(r.text) || 0), 0);
     if (!isBlockedCompaction(r)) {
       log(`compaction ok model=${model} status=${r.status} finish=${r.finish || "-"} bytes=${r.text.length}`);
       writeBuffered(res, r);
-      return true;
+      return;
     }
 
     log(`compaction blocked model=${model} status=${r.status} finish=${r.finish || "-"}; handing off to ${COMPACTION_MODEL}`);
     PROXY_STATE.compactionHandoffs = (PROXY_STATE.compactionHandoffs || 0) + 1;
-    const handoffBody = rewriteModel(body, COMPACTION_MODEL);
-    const handoffTokens = estimateTokens(handoffBody, readRequest(handoffBody).maxTokens);
-    let handoffReservation = null;
-    if (hasLimiter(COMPACTION_MODEL, slot)) handoffReservation = await acquire(COMPACTION_MODEL, handoffTokens, 0, slot);
-    const r2 = await forwardBuffered(req, url, handoffBody, COMPACTION_MODEL);
-    reconcileTokens(handoffReservation, Math.max(handoffTokens, usageTokens(r2.text) || 0), 0);
+    const r2 = await dispatch(COMPACTION_MODEL, rewriteModel(body, COMPACTION_MODEL));
+    if (!r2) return;
     log(`compaction handoff model=${COMPACTION_MODEL} status=${r2.status} finish=${r2.finish || "-"} bytes=${r2.text.length}`);
     writeBuffered(res, r2);
-    return true;
+    return;
   }
-  return false;
 }
 
 function usageTokens(text) {

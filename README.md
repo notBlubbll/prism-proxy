@@ -77,9 +77,11 @@ completions endpoint rejects function tools combined with reasoning
 Responses API accepts them. Responses-only models (`gpt-5*-codex`,
 `gpt-5*-pro`) can be added to the `models` map as well.
 
-If the Responses endpoint returns a transient gateway error (such as HTTP 502)
-before streaming starts, the proxy retries the same request up to five times.
-Each attempt uses a rate-limit slot. An ongoing stream is never replayed.
+If a text endpoint returns HTTP 502 before streaming starts, the proxy waits
+and retries the same request while the client stays connected. Each attempt
+uses a rate-limit slot. Canceling the request stops further retries. Other
+transient gateway errors are retried up to five times. An ongoing stream is
+never replayed.
 
 ## Keys
 
