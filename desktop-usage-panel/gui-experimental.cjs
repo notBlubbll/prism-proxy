@@ -246,8 +246,10 @@ function buildPanel(endpoint, refreshMs, headingText, getSessionId, getTitle) {
   keyFilterBox.appendChild(keySelect);
   let keyOptionsSig = "";
   function renderKeyFilter() {
-    const ids = ["all", ...keys.map((k) => String(k.index))];
-    if (!ids.includes(keyView)) keyView = "all";
+    // With one key there is nothing to filter; hide the "all keys" selector.
+    const ids = keys.length > 1 ? ["all", ...keys.map((k) => String(k.index))] : keys.map((k) => String(k.index));
+    if (!ids.includes(keyView)) keyView = ids[0] || "all";
+    keyFilterBox.style.display = keys.length > 1 ? "inline-flex" : "none";
     const sig = ids.join(",");
     if (sig !== keyOptionsSig) {
       keyOptionsSig = sig;
