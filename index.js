@@ -1140,7 +1140,7 @@ async function pingModel(model, auth, pingSlot = 0) {
     reconcileTokens(reservation, tokens ?? estTokens, tokens == null ? Buffer.byteLength(res.text) : 0);
     return { model, ok: true, queueMs, ms, text };
   } catch (e) {
-    return { model, ok: false, queueMs, ms: Date.now() - started, error: String(e?.message || e) };
+    return { model, ok: false, queueMs, ms: Date.now() - started, error: isUpstreamDisconnect(e) ? UPSTREAM_CONNECTION_ERROR : String(e?.message || e) };
   }
 }
 
@@ -1411,6 +1411,24 @@ function upstreamRequest(target, opts) {
   });
 }
 
+const UPSTREAM_CONNECTION_ERROR = "The connection to the upstream provider failed.";
+
+function isUpstreamDisconnect(error) {
+  return ["ECONNRESET", "EPIPE", "ERR_STREAM_PREMATURE_CLOSE"].includes(error?.code) ||
+    /\b(?:ECONNRESET|socket hang up)\b/i.test(error?.message || "");
+}
+
+function upstreamTransportFailure(error, retryDisconnects) {
+  log(`upstream connection error: ${error?.message || error}`);
+  if (retryDisconnects && isUpstreamDisconnect(error)) return { gatewayError: "connection reset", headers: {} };
+  return {
+    status: 502,
+    headers: { "content-type": "application/json" },
+    text: JSON.stringify({ error: { message: UPSTREAM_CONNECTION_ERROR } }),
+    finish: null,
+  };
+}
+
 function targetUrl(urlPath, model) {
   const base = ROOT_MODELS.has(model) ? ROOT_PATH : UPSTREAM_PATH;
   const suffix = urlPath.replace(/^\/v1(?=\/)/, "");
@@ -1497,13 +1515,13 @@ function parseRetryAfterMs(headers) {
   return null;
 }
 
-async function waitForBadGateway(model, count, headers, signal, sessionId) {
+async function waitForBadGateway(model, count, { headers, gatewayError }, signal, sessionId) {
   const backoff = Math.min(500 * 2 ** Math.min(count - 1, 5), 15000);
   const retryAfter = parseRetryAfterMs(headers);
   const wait = retryAfter > 0 ? Math.min(RETRY_AFTER_CAP_MS, Math.max(500, retryAfter)) : backoff;
   PROXY_STATE.retries5xx = (PROXY_STATE.retries5xx || 0) + 1;
   noteSessionRetry(sessionId, 502, model);
-  log(`upstream 502 for ${model}; retrying in ${wait / 1000}s (gateway retry ${count})`);
+  log(`upstream ${gatewayError} for ${model}; retrying in ${wait / 1000}s (gateway retry ${count})`);
   await waitForRetry(wait, signal);
 }
 
@@ -1889,7 +1907,7 @@ async function handle(req, res) {
       });
       if (signal.aborted) return;
       if (result.gatewayError) {
-        await waitForBadGateway(model, ++gatewayAttempts, result.headers, signal, sessionId);
+        await waitForBadGateway(model, ++gatewayAttempts, result, signal, sessionId);
         continue;
       }
       gatewayAttempts = 0;
@@ -1973,28 +1991,29 @@ function forward(req, res, url, body, model, isChat, opts = {}) {
     let tail = "";
     const finish = (v) => { if (!settled) { settled = true; resolve(v); } };
 
+    const failTransport = (err) => {
+      if (settled) return;
+      if (opts.signal?.aborted || res.destroyed) return finish({ done: true });
+      const failure = upstreamTransportFailure(err, opts.retry5xx && !res.headersSent);
+      if (failure.gatewayError) return finish(failure);
+      if (res.headersSent) res.destroy();
+      else sendJson(res, failure.status, failure.text);
+      finish({ done: true });
+    };
+
     let up;
     try {
       up = upstreamRequest(targetUrl(url.pathname + url.search, model), { method: req.method, headers, signal: opts.signal });
     } catch (err) {
-      log(`upstream request failed: ${err?.message || err}`);
-      send(res, 502, "text/plain", `prism-proxy: ${err?.message || err}\n`);
-      return finish({ done: true });
+      return failTransport(err);
     }
 
-    up.on("error", (err) => {
-      if (settled) return;
-      if (opts.signal?.aborted) return finish({ done: true });
-      if (res.headersSent) { try { res.end(); } catch {} return finish({ done: true }); }
-      log(`upstream error: ${err?.message || err}`);
-      send(res, 502, "text/plain", `prism-proxy upstream error: ${err?.message || err}\n`);
-      finish({ done: true });
-    });
+    up.on("error", failTransport);
 
     up.on("response", (rawRes) => {
       const status = rawRes.statusCode || 502;
       if (status === 502 && opts.retry5xx) {
-        finish({ gatewayError: true, headers: rawRes.headers });
+        finish({ gatewayError: "502", headers: rawRes.headers });
         rawRes.destroy();
         return;
       }
@@ -2006,9 +2025,6 @@ function forward(req, res, url, body, model, isChat, opts = {}) {
       const upRes = dec ? rawRes.pipe(dec) : rawRes;
       if (dec) rawRes.on("error", (e) => dec.destroy(e));
       const eventStream = String(rawRes.headers["content-type"] || "").includes("event-stream");
-      const sse = isChat && status === 200 && eventStream;
-      let held = null;
-      let holdDone = false;
       const readUsage = status === 200 && (opts.isMessages || opts.isImage)
         ? captureNativeUsage(upRes, eventStream, opts.isMessages) : null;
       upRes.on("data", (c) => {
@@ -2026,29 +2042,6 @@ function forward(req, res, url, body, model, isChat, opts = {}) {
             if (/"(reasoning|reasoning_content)"\s*:\s*"[^"]/.test(text)) sawReasoning = true;
           }
         }
-        // First chunk of a 200 SSE stream: check for an error frame before the
-        // client sees anything. Both error frames and real chunks can share the
-        // chunk, so an error only blocks when no real content is beside it.
-        if (sse && !holdDone && held === null) {
-          held = c;
-          const looksError = /"error"\s*:\s*(?!null\b)[{"]/.test(text) && !/"choices"/.test(text) && !/"(content|reasoning|reasoning_content|text)"\s*:\s*"/.test(text);
-          if (looksError) {
-            holdDone = true; // nothing goes to the client from this stream
-            const errText = text.replace(/\s+/g, " ").slice(0, 400);
-            log(`res 200 (stream error) model=${model || "-"} :: ${errText}`);
-            if (!res.headersSent) {
-              if (isChat && opts.retry5xx) return finish({ serverError: true, status: 502, headers: rawRes.headers, text: errText });
-              res.writeHead(502, { "content-type": "text/plain" });
-              res.end(`prism-proxy: upstream stream error: ${errText}\n`);
-              return finish({ done: true });
-            }
-            try { res.end(); } catch {}
-            return finish({ done: true });
-          }
-          releaseHeld();
-          return;
-        }
-        if (sse && !holdDone) return; // still holding; more data waits for the first-chunk decision
       });
       const hdrs = { ...rawRes.headers, ...(opts.headers || {}) };
       delete hdrs["transfer-encoding"];
@@ -2067,20 +2060,6 @@ function forward(req, res, url, body, model, isChat, opts = {}) {
         }).catch(() => { sendJson(res, 502, '{"error":{"message":"Failed to read upstream model catalog"}}'); finish({ done: true }); });
         return;
       }
-
-      // A 200 SSE stream can still carry an error frame as its first data line
-      // (e.g. `data: {"error":{"code":"upstream_rejected_request",...}}`): the
-      // provider failed after the HTTP status was already 200. Buffer the first
-      // chunk and check before anything reaches the client, so the turn can be
-      // retried instead of failing with "Provider returned error".
-      const releaseHeld = () => {
-        if (holdDone || held === null) return;
-        holdDone = true;
-        res.writeHead(status, hdrs);
-        res.write(held);
-        held = null;
-        upRes.pipe(res); // only the remaining chunks are piped
-      };
 
       if (status !== 200) {
         // Always leave a trace of a non-2xx: this is what makes a failed turn
@@ -2108,9 +2087,11 @@ function forward(req, res, url, body, model, isChat, opts = {}) {
             finish({ done: true });
           });
           upRes.on("error", () => {
+            if (settled || opts.signal?.aborted) return finish({ done: true });
             if (retryable) return finish({ serverError: true, status, headers: rawRes.headers, text: "" });
             if (throttled) return finish({ retry: true, status, headers: upRes.headers, text: "" });
-            try { res.end(); } catch {}
+            res.writeHead(status, hdrs);
+            res.end();
             finish({ done: true });
           });
           return;
@@ -2118,15 +2099,34 @@ function forward(req, res, url, body, model, isChat, opts = {}) {
       }
 
       log(`res ${status} model=${model || "-"} ct=${hdrs["content-type"] || "-"}`);
-      if (sse) {
-        // SSE: release held first chunk at end if the error check never ran
-        upRes.on("end", () => { releaseHeld(); finish({ done: true, status, bytes: respBytes, tail, timing: timing2() }); });
-        upRes.on("error", () => { try { res.end(); } catch {} finish({ done: true, status, bytes: respBytes, tail, timing: timing2() }); });
+      upRes.on("error", failTransport);
+      upRes.on("end", () => {
+        if (settled || opts.signal?.aborted) return finish({ done: true });
+        if (!res.headersSent) { res.writeHead(status, hdrs); res.end(); }
+        finish({ done: true, status, bytes: respBytes, tail, usage: readUsage?.(), timing: timing2() });
+      });
+      if (status === 200 && opts.retry5xx) {
+        // The upstream can reset after its headers; commit the downstream response with the first body chunk.
+        upRes.once("data", (first) => {
+          if (settled || opts.signal?.aborted) return;
+          if (isChat && eventStream) {
+            const text = first.toString("utf8");
+            const looksError = /"error"\s*:\s*(?!null\b)[{"]/.test(text) && !/"choices"/.test(text) && !/"(content|reasoning|reasoning_content|text)"\s*:\s*"/.test(text);
+            if (looksError) {
+              const errText = text.replace(/\s+/g, " ").slice(0, 400);
+              log(`res 200 (stream error) model=${model || "-"} :: ${errText}`);
+              finish({ serverError: true, status: 502, headers: rawRes.headers, text: errText });
+              rawRes.destroy();
+              return;
+            }
+          }
+          res.writeHead(status, hdrs);
+          res.write(first);
+          upRes.pipe(res);
+        });
       } else {
         res.writeHead(status, hdrs);
         upRes.pipe(res);
-        upRes.on("end", () => finish({ done: true, status, bytes: respBytes, tail, usage: readUsage?.(), timing: timing2() }));
-        upRes.on("error", () => { try { res.end(); } catch {} finish({ done: true, status, bytes: respBytes, tail, usage: readUsage?.(), timing: timing2() }); });
       }
     });
 
@@ -2307,16 +2307,17 @@ function rewriteModel(body, model) {
 function forwardBuffered(req, url, body, model, signal) {
   return new Promise((resolve) => {
     const headers = buildForwardHeaders(req.headers, body.length);
+    const failTransport = (err) => resolve(signal.aborted ? null : upstreamTransportFailure(err, true));
     let up;
     try {
       up = upstreamRequest(targetUrl(url.pathname + url.search, model), { method: req.method, headers, signal });
     } catch (err) {
-      return resolve({ status: 502, headers: {}, text: `prism-proxy: ${err?.message || err}`, finish: null });
+      return failTransport(err);
     }
-    up.on("error", (err) => resolve({ status: 502, headers: {}, text: `prism-proxy upstream error: ${err?.message || err}`, finish: null }));
+    up.on("error", failTransport);
     up.on("response", (upRes) => {
       if (upRes.statusCode === 502) {
-        resolve({ gatewayError: true, headers: upRes.headers });
+        resolve({ gatewayError: "502", headers: upRes.headers });
         upRes.destroy();
         return;
       }
@@ -2333,7 +2334,7 @@ function forwardBuffered(req, url, body, model, signal) {
           finish: extractFinish(upRes.headers["content-type"], text),
         });
       });
-      upRes.on("error", (err) => resolve({ status: 502, headers: {}, text: `prism-proxy stream error: ${err?.message || err}`, finish: null }));
+      upRes.on("error", failTransport);
     });
     up.end(body);
   });
@@ -2406,7 +2407,7 @@ async function runCompaction(req, res, url, body, model, slot, signal) {
       const r = await forwardBuffered(req, url, payload, target, signal);
       if (signal.aborted) return null;
       if (r.gatewayError) {
-        await waitForBadGateway(target, ++gatewayAttempts, r.headers, signal, sessionId);
+        await waitForBadGateway(target, ++gatewayAttempts, r, signal, sessionId);
         continue;
       }
       reconcileTokens(reservation, r.status === 429 ? 0 : Math.max(tokens, usageTokens(r.text) || 0), 0);

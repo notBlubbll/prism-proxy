@@ -97,13 +97,65 @@ test("Canceling a request awaiting gateway recovery clears its retry state", { t
   assert.equal(attempts, 1);
 });
 
-test("Compaction waits out upstream 502s on the original and handoff models", { timeout: 10000 }, async (t) => {
+test("Text requests survive an upstream reset before headers or before the first body chunk", { timeout: 15000 }, async (t) => {
+  const attempts = [];
+  const stream = 'event: response.completed\ndata: {"type":"response.completed"}\n\n';
+  const base = await startProxy(t, async (req, res) => {
+    attempts.push({ path: req.url, key: req.headers.authorization, body: await new Response(req).text() });
+    if (attempts.length === 1) return req.socket.destroy();
+    res.writeHead(200, { "content-type": "text/event-stream" });
+    if (attempts.length === 2) {
+      res.flushHeaders();
+      return setTimeout(() => req.socket.destroy(), 25);
+    }
+    res.end(stream);
+  });
+  const body = JSON.stringify({ model: "gpt-6.2-astra", input: "ping", stream: true });
+  const reply = await fetch(`${base}/v1/responses`, {
+    method: "POST", headers: { "content-type": "application/json" }, body,
+  });
+  assert.equal(reply.status, 200);
+  assert.equal(await reply.text(), stream);
+  assert.deepEqual(attempts, Array(3).fill({ path: "/doway/v1/responses", key: "Bearer test", body }));
+  const status = await (await fetch(`${base}/status`)).json();
+  assert.equal(status.global["global|1"].total, attempts.length);
+  assert.equal(status.retries5xx, 2);
+});
+
+test("A reset after a streamed event does not replay the request", { timeout: 10000 }, async (t) => {
+  let attempts = 0;
+  let upstreamSocket;
+  const event = 'event: response.output_text.delta\ndata: {"delta":"partial"}\n\n';
+  const base = await startProxy(t, (req, res) => {
+    attempts++;
+    upstreamSocket = req.socket;
+    req.resume();
+    res.writeHead(200, { "content-type": "text/event-stream" });
+    res.write(event);
+  });
+  const reply = await fetch(`${base}/v1/responses`, { method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ model: "gpt-6.2-astra", input: "ping", stream: true }) });
+  const reader = reply.body.getReader();
+  assert.equal(new TextDecoder().decode((await reader.read()).value), event);
+  upstreamSocket.destroy();
+  await assert.rejects(reader.read());
+  const status = await (await fetch(`${base}/status`)).json();
+  assert.equal(attempts, 1);
+  assert.equal(status.retries5xx, 0);
+});
+
+test("Compaction waits out 502s and resets without delivering partial buffered replies", { timeout: 12000 }, async (t) => {
   const called = [];
   const base = await startProxy(t, async (req, res) => {
     const { model } = await new Response(req).json();
     called.push(model);
-    if (called.length === 1 || called.length === 3) return res.writeHead(502).end("Bad Gateway");
-    if (called.length === 2) return res.writeHead(400).end('{"error":"Refused"}');
+    if (called.length === 1 || called.length === 4) return res.writeHead(502).end("Bad Gateway");
+    if (called.length === 2 || called.length === 5) {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.write('{"choices":[');
+      return setTimeout(() => req.socket.destroy(), 25);
+    }
+    if (called.length === 3) return res.writeHead(400).end('{"error":"Refused"}');
     res.writeHead(200, { "content-type": "application/json" }).end('{"choices":[{"finish_reason":"stop"}]}');
   });
   const body = { model: "gpt-6.2-astra", messages: [{ role: "user", content: "x".repeat(21000) }] };
@@ -112,9 +164,23 @@ test("Compaction waits out upstream 502s on the original and handoff models", { 
   });
   assert.equal(result.status, 200);
   assert.equal((await result.json()).choices[0].finish_reason, "stop");
-  assert.deepEqual(called, ["gpt-6.2-astra", "gpt-6.2-astra", "gpt-6.2-sol", "gpt-6.2-sol"]);
+  assert.deepEqual(called, [...Array(3).fill("gpt-6.2-astra"), ...Array(3).fill("gpt-6.2-sol")]);
   const status = await (await fetch(`${base}/status`)).json();
   assert.equal(status.global["global|1"].total, called.length);
+});
+
+test("An interrupted image generation is not resubmitted or exposed as a raw socket error", { timeout: 10000 }, async (t) => {
+  let attempts = 0;
+  const base = await startProxy(t, (req) => { attempts++; req.socket.destroy(); });
+  const reply = await fetch(`${base}/v1/images/generations`, {
+    method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ model: "gpt-image-2", prompt: "test" }),
+  });
+  assert.equal(reply.status, 502);
+  const { error } = await reply.json();
+  assert.ok(error.message);
+  assert.doesNotMatch(error.message, /ECONNRESET|EPIPE|socket hang up|prism-proxy upstream error/i);
+  assert.equal(attempts, 1);
 });
 
 test("Root aliases use their native APIs, the pooled key, and the shared usage window", { timeout: 15000 }, async (t) => {
