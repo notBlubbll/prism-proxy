@@ -103,6 +103,7 @@
                 },
                 "gpt-6.2-sol": {
                     "name": "GPT-6.2 Sol",
+                    "settings": { "reasoningSummary": "detailed" },
                     "cost": [
                         {
                             "input": 2,
@@ -171,6 +172,7 @@
                 },
                 "gpt-6.2-astra": {
                     "name": "GPT-6.2 Astra",
+                    "settings": { "reasoningSummary": "detailed" },
                     "cost": [
                         {
                             "input": 8,
@@ -239,6 +241,7 @@
                 },
                 "gpt-6.1-sol": {
                     "name": "GPT-6.1 Sol",
+                    "settings": { "reasoningSummary": "detailed" },
                     "cost": [
                         {
                             "input": 2,
@@ -307,6 +310,7 @@
                 },
                 "gpt-6.1-terra": {
                     "name": "GPT-6.1 Terra",
+                    "settings": { "reasoningSummary": "detailed" },
                     "cost": [
                         {
                             "input": 1,
@@ -375,6 +379,7 @@
                 },
                 "gpt-6-sol": {
                     "name": "GPT-6 Sol",
+                    "settings": { "reasoningSummary": "detailed" },
                     "cost": [
                         {
                             "input": 2,
@@ -443,6 +448,7 @@
                 },
                 "gpt-6-luna": {
                     "name": "GPT-6 Luna",
+                    "settings": { "reasoningSummary": "detailed" },
                     "cost": [
                         {
                             "input": 0.1,
@@ -511,6 +517,7 @@
                 },
                 "gpt-5.6-terra": {
                     "name": "GPT-5.6 Terra",
+                    "settings": { "reasoningSummary": "detailed" },
                     "cost": [
                         {
                             "input": 2,
@@ -579,6 +586,7 @@
                 },
                 "gpt-5.6-luna": {
                     "name": "GPT-5.6 Luna",
+                    "settings": { "reasoningSummary": "detailed" },
                     "cost": [
                         {
                             "input": 0.2,
@@ -647,6 +655,7 @@
                 },
                 "gpt-5.5": {
                     "name": "GPT-5.5",
+                    "settings": { "reasoningSummary": "detailed" },
                     "cost": [
                         {
                             "input": 5,
@@ -715,6 +724,7 @@
                 },
                 "gpt-5.4": {
                     "name": "GPT-5.4",
+                    "settings": { "reasoningSummary": "detailed" },
                     "cost": [
                         {
                             "input": 2.5,
@@ -783,6 +793,7 @@
                 },
                 "gpt-5.4-nano": {
                     "name": "GPT-5.4 Nano",
+                    "settings": { "reasoningSummary": "detailed" },
                     "cost": {
                         "input": 0.2,
                         "output": 1.25,
@@ -828,6 +839,7 @@
                 },
                 "gpt-5.1": {
                     "name": "GPT-5.1",
+                    "settings": { "reasoningSummary": "detailed" },
                     "cost": {
                         "input": 1.07,
                         "output": 8.5,
@@ -885,6 +897,7 @@
                 },
                 "gpt-5": {
                     "name": "GPT-5",
+                    "settings": { "reasoningSummary": "detailed" },
                     "cost": {
                         "input": 1.07,
                         "output": 8.5,

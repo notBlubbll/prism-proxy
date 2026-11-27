@@ -14,6 +14,10 @@
 const { Plugin, Panel, MenuItem, Command, ComposerPill, Registry, Contract } = require("@opencode/plugin/gui");
 const { createComponent, createEffect, createSignal, onCleanup } = require("solid-js");
 const { insert } = require("solid-js/web");
+const catalogRpc = { id: "prism-usage.catalog", events: {}, methods: {
+  sync: { input: { type: "object", additionalProperties: false }, output: { type: "array", items: { type: "string" } } },
+} };
+const schedulingRpc = { id:'prism-usage.scheduling', events:{}, methods:{control:{input:{type:'object',required:['action','session'],properties:{action:{enum:['pause','resume','focus','unfocus']},session:{type:'string'},owner:{type:'string'}},additionalProperties:false},output:{type:'boolean'}}} };
 
 // Live retry state from the proxy's /status, read by the composer pill. One
 // signal for every window, refreshed once a second.
@@ -131,12 +135,12 @@ function money(n) {
 
 const BORDER = "1px solid rgba(127,127,127,.18)";
 
-function buildPanel(ui, endpoint, refreshMs, headingText, getSessionId, getTitle) {
+function buildPanel(ui, endpoint, refreshMs, headingText, getSessionId, getSessionInfo, syncModels, control) {
   const sessionId = () => {
     try { return typeof getSessionId === "function" ? getSessionId() : null; } catch { return null; }
   };
-  const titleOf = (id) => {
-    try { return typeof getTitle === "function" ? getTitle(id) : null; } catch { return null; }
+  const infoOf = (id) => {
+    try { return getSessionInfo?.(id); } catch { return null; }
   };
   const root = document.createElement("div");
   root.style.cssText = [
@@ -146,6 +150,8 @@ function buildPanel(ui, endpoint, refreshMs, headingText, getSessionId, getTitle
     "height:100%",
     "overflow:auto",
     "box-sizing:border-box",
+    "container:prism-panel / inline-size",
+    "width:100%;max-width:100%;min-width:0",
     "display:flex",
     "flex-direction:column",
     "gap:12px",
@@ -158,6 +164,43 @@ function buildPanel(ui, endpoint, refreshMs, headingText, getSessionId, getTitle
   root.className = "prism-usage-panel";
   const style = document.createElement("style");
   style.textContent = `
+    .prism-usage-panel > * { min-inline-size:0; }
+    .prism-usage-panel .prism-table-scroll { overflow-x:auto; flex:none; }
+    .prism-usage-panel .prism-icon-action { width:28px; height:28px; padding:0; display:inline-grid; place-items:center; color:inherit; background:transparent; border:0; border-radius:4px; cursor:pointer; }
+    .prism-usage-panel .prism-icon-action:hover { background:var(--surface-base-hover,color-mix(in srgb,currentColor 8%,transparent)); }
+    .prism-usage-panel .prism-title-toggle,.prism-usage-panel .prism-compact-forecast,.prism-usage-panel .prism-more-columns { display:none; }
+    @container prism-panel (max-width:760px) {
+      .prism-models:not([data-full]) :is(td,th):is(:nth-child(3),:nth-child(4),:nth-child(6),:nth-child(7),:nth-child(8),:nth-child(9)) { display:none; }
+      .prism-models:not([data-full]) table { table-layout:fixed; }
+      .prism-models:not([data-full]) :is(td,th):first-child { width:40%; }
+      .prism-models:not([data-full]) :is(td,th) { overflow:hidden; text-overflow:ellipsis; }
+      .prism-usage-panel .prism-more-columns { display:inline-flex; align-self:flex-start; }
+      .prism-sessions :is(table,tbody,tr:not(.prism-session-row)),.prism-sessions .prism-group-cell { display:block; min-width:0; }
+      .prism-sessions .prism-session-head { display:none !important; }
+      .prism-session-row { display:grid; grid-template-columns:minmax(0,1fr) auto; align-items:center; border-bottom:1px solid var(--border-weak-base,rgba(127,127,127,.18)); padding-block:4px; }
+      .prism-session-row > td { min-width:0; padding:0 4px !important; border:0 !important; }
+      .prism-session-name { grid-area:1/1; max-width:none !important; }
+      .prism-session-action { grid-area:1/2; }
+      .prism-session-state { grid-area:2/1/auto/-1; white-space:normal !important; overflow-wrap:anywhere; }
+      .prism-usage-panel .prism-compact-forecast { display:inline; opacity:.75; }
+      .prism-session-name:has(.prism-title-toggle) > .prism-title { display:none; }
+      .prism-usage-panel .prism-title-toggle { display:block; width:100%; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; text-align:start; font:inherit; color:inherit; border:0; background:transparent; padding:3px 0; cursor:pointer; }
+      .prism-title-toggle::before { content:'›'; display:inline-block; margin-inline-end:6px; }
+      .prism-title-toggle[aria-expanded=true]::before { transform:rotate(90deg); }
+      .prism-session-row > [data-metric] { display:none; }
+      .prism-session-row[data-expanded] > [data-metric] { display:block; grid-column:1/-1; text-align:start !important; max-width:none !important; white-space:normal !important; overflow-wrap:anywhere; }
+      .prism-session-row [data-metric]::before { content:attr(data-metric) ': '; opacity:.7; }
+    }
+    .prism-usage-panel .prism-unused { flex:none; }
+    .prism-usage-panel .prism-unused-list { --row-height:2em; max-block-size:calc(7 * var(--row-height)); overflow-y:auto; list-style:none; margin:0; padding:0; }
+    .prism-usage-panel .prism-unused-list li { display:flex; align-items:center; justify-content:space-between; gap:8px; height:var(--row-height); }
+    .prism-usage-panel .prism-unused-name { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    @media (prefers-reduced-motion:no-preference) {
+      @supports (interpolate-size:allow-keywords) and selector(details::details-content) {
+        .prism-usage-panel .prism-unused::details-content { interpolate-size:allow-keywords; block-size:0; overflow:clip; opacity:0; transition:block-size 180ms ease-out, opacity 140ms ease-out, content-visibility 180ms allow-discrete; }
+        .prism-usage-panel .prism-unused[open]::details-content { block-size:auto; opacity:1; }
+      }
+    }
     .prism-usage-panel .prism-live-rates { display:grid; grid-template-columns:repeat(auto-fit,minmax(130px,1fr)); gap:8px 16px; }
     .prism-usage-panel .prism-rate { display:grid; grid-template-columns:auto 1fr; align-items:baseline; gap:3px 6px; }
     .prism-usage-panel .prism-rate span:last-of-type { text-align:end; font-variant-numeric:tabular-nums; }
@@ -196,8 +239,12 @@ function buildPanel(ui, endpoint, refreshMs, headingText, getSessionId, getTitle
 
   const heading = document.createElement("div");
   heading.textContent = headingText || "Usage";
-  heading.style.cssText = "font-weight:650;font-size:13px;margin-right:auto;letter-spacing:.01em";
+  heading.style.cssText = "font-weight:650;font-size:13px;letter-spacing:.01em";
   head.appendChild(heading);
+  const pacing = document.createElement("span");
+  // Base wrapping on the available panel width, never on the changing countdown text.
+  pacing.style.cssText = "flex:1 1 8rem;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-size:11px;color:var(--text-weak,inherit);font-variant-numeric:tabular-nums";
+  head.appendChild(pacing);
 
   let win = "24u";
   const buttons = {};
@@ -227,6 +274,44 @@ function buildPanel(ui, endpoint, refreshMs, headingText, getSessionId, getTitle
 
   // Key filter next to the window pills: "all" (combined, the default) or one key.
   const [keyView, setKeyView] = createSignal("all");
+  const waitLabels = {
+    "session-budget": "Saving room for sessions",
+    "rpm-pacing": "Spacing requests · RPM", "tpm-pacing": "Spacing requests · TPM",
+    "rpm-limit": "Waiting for RPM", "tpm-limit": "Waiting for TPM", upstream: "Upstream cooldown",
+  };
+  createEffect(() => {
+    const status = proxyStatus();
+    const threshold = status?.globalLimits?.paceStartPercent;
+    if (threshold == null) {
+      pacing.textContent = "Pacing unavailable";
+      pacing.title = "No live pacing report from the proxy";
+      return;
+    }
+    const active = Object.entries(status.global || {}).filter(([slot, state]) =>
+      (keyView() === "all" || slot === `global|${keyView()}`) && state.wait?.remainingMs > 0
+    );
+    const sampledAt = status.updated ?? Date.now();
+    function updateLabel() {
+      const elapsed = Math.max(0, Date.now() - sampledAt);
+      const waits = active.map(([slot, state]) => {
+        const key = status.keys > 1 ? `Key ${slot.split("|")[1] || "default"}: ` : "";
+        const { reason, releaseAmount, remainingMs } = state.wait;
+        if (elapsed >= remainingMs) return `${key}Rechecking capacity…`;
+        const seconds = `${(Math.ceil((remainingMs - elapsed) / 100) / 10).toFixed(1)}s`;
+        const unit = reason.startsWith("tpm") || reason === "session-budget" ? "tokens" : releaseAmount === 1 ? "slot" : "slots";
+        const detail = releaseAmount > 0 ? `${fmt(releaseAmount)} ${unit} free in ${seconds}` : seconds;
+        return `${key}${waitLabels[reason] || "Waiting"} · ${detail}`;
+      });
+      const off = threshold >= 100 || (status.globalLimits.requests === "off" && status.globalLimits.tokens === "off");
+      pacing.textContent = waits.length ? waits[0] + (waits.length > 1 ? ` (+${waits.length - 1})` : "") : off ? "Pacing off" : "No pacing delay";
+      pacing.title = waits.length ? waits.join("\n") : off ? "Adaptive pacing is disabled" : `Adaptive pacing starts above ${threshold}% of a key’s RPM or TPM limit`;
+    }
+    updateLabel();
+    if (active.length) {
+      const timer = setInterval(updateLabel, 100);
+      onCleanup(() => clearInterval(timer));
+    }
+  });
   const keyFilterBox = document.createElement("span");
   keyFilterBox.style.cssText = "display:inline-flex;gap:4px;margin-left:6px;padding-left:8px;border-left:" + BORDER;
   const keySelect = document.createElement("select");
@@ -363,7 +448,95 @@ function buildPanel(ui, endpoint, refreshMs, headingText, getSessionId, getTitle
   // ---- table --------------------------------------------------------------
   const table = document.createElement("table");
   table.style.cssText = "width:100%;border-collapse:collapse;font-variant-numeric:tabular-nums;user-select:text;-webkit-user-select:text";
-  root.appendChild(table);
+  const modelScroll = document.createElement('div');
+  modelScroll.className = 'prism-models prism-table-scroll';
+  modelScroll.appendChild(table);
+  const columnsButton = document.createElement('button');
+  columnsButton.className = 'prism-range prism-more-columns';
+  columnsButton.type = 'button';
+  columnsButton.textContent = 'Show all columns';
+  columnsButton.setAttribute('aria-expanded','false');
+  columnsButton.onclick = () => {
+    const full = modelScroll.toggleAttribute('data-full');
+    columnsButton.textContent = full ? 'Show fewer columns' : 'Show all columns';
+    columnsButton.setAttribute('aria-expanded', String(full));
+  };
+  root.append(modelScroll, columnsButton);
+
+  const unused = document.createElement("details");
+  unused.className = "prism-unused";
+  const unusedHeading = document.createElement("summary");
+  unusedHeading.textContent = "Unused models";
+  unusedHeading.style.cssText = "cursor:pointer;font-weight:600";
+  const tools = document.createElement("div");
+  tools.style.cssText = "display:flex;gap:8px;align-items:center;margin:8px 0";
+  const search = document.createElement("input");
+  search.type = "search";
+  search.placeholder = "Search unused models…";
+  search.setAttribute("aria-label", "Search unused models");
+  search.style.cssText = "min-width:0;flex:1;font:inherit;color:inherit;background:transparent;border:" + BORDER + ";border-radius:5px;padding:4px 8px";
+  tools.appendChild(search);
+  const [syncing, setSyncing] = createSignal(false);
+  insert(tools, createComponent(ui.Button, {
+    children: "Sync models", size: "small", variant: "ghost", type: "button",
+    get busy() { return syncing(); }, get disabled() { return syncing(); }, onClick: () => syncCatalog(),
+  }));
+  const catalogNote = document.createElement("div");
+  catalogNote.setAttribute("role", "status");
+  const unusedList = document.createElement("ul");
+  unusedList.className = "prism-unused-list";
+  unusedList.setAttribute("aria-label", "Unused model results");
+  unused.append(unusedHeading, tools, catalogNote, unusedList);
+  root.appendChild(unused);
+
+  let catalog = null;
+  let catalogDue = 0;
+  let catalogError = false;
+  let usedIds = null;
+  let lastList = "";
+  function showUnused() {
+    const ids = catalog && usedIds ? catalog.filter(id => !usedIds.has(id)) : null;
+    unusedHeading.textContent = ids ? `Unused models (${ids.length})` : "Unused models";
+    if (!unused.open) return;
+    const query = search.value.trim().toLowerCase();
+    const matches = (ids || []).filter(id => `${id} ${displayModel(id)}`.toLowerCase().includes(query));
+    const notes = [];
+    if (catalogError) notes.push(catalog ? "Sync failed. Showing last synced catalog." : "Model catalog unavailable.");
+    if (!usedIds) notes.push("Waiting for usage data.");
+    else if (!catalog && !catalogError) notes.push("Loading model catalog…");
+    else if (ids && !matches.length) notes.push(query ? "No matching unused models." : "No unused models in this range.");
+    catalogNote.textContent = notes.join(" ");
+    const signature = JSON.stringify(matches);
+    if (signature === lastList) return;
+    lastList = signature;
+    unusedList.replaceChildren(...matches.map(id => {
+      const item = document.createElement("li");
+      const name = document.createElement("span");
+      name.className = "prism-unused-name";
+      name.textContent = id;
+      name.title = id;
+      const count = document.createElement("span");
+      count.style.whiteSpace = "nowrap";
+      count.textContent = "0 requests";
+      item.append(name, count);
+      return item;
+    }));
+  }
+  search.oninput = unused.ontoggle = showUnused;
+  const catalogAbort = new AbortController();
+  async function syncCatalog() {
+    if (syncing() || catalogAbort.signal.aborted) return;
+    setSyncing(true);
+    try {
+      catalog = await syncModels();
+      catalogError = false;
+    } catch { catalogError = true; }
+    finally {
+      catalogDue = Date.now() + (catalogError ? 60000 : 15 * 60000);
+      setSyncing(false);
+      if (!catalogAbort.signal.aborted) showUnused();
+    }
+  }
 
   const footer = document.createElement("div");
   footer.style.cssText = "margin-top:auto;padding-top:6px;opacity:.5;font-size:11px";
@@ -384,8 +557,39 @@ function buildPanel(ui, endpoint, refreshMs, headingText, getSessionId, getTitle
   sessionsBox.appendChild(sessionsList);
   // Sits between the table and the footer, i.e. in the middle of the panel.
   root.insertBefore(sessionsBox, footer);
+  const errorsBox = document.createElement("details");
+  errorsBox.className = "prism-unused";
+  const errorsHeading = document.createElement("summary");
+  errorsHeading.style.cursor = "pointer";
+  const errorsList = document.createElement("ul");
+  errorsList.className = "prism-unused-list";
+  errorsBox.append(errorsHeading, errorsList);
+  root.insertBefore(errorsBox, footer);
+  let errorsSignature;
+  createEffect(() => {
+    const errors = proxyStatus()?.recentErrors || [];
+    const signature = JSON.stringify(errors);
+    if (signature === errorsSignature) return;
+    errorsSignature = signature;
+    errorsBox.hidden = !errors.length;
+    errorsHeading.textContent = errors.length ? `Recent errors (${errors.length}) · HTTP ${errors[0].status}` : "Recent errors";
+    errorsList.replaceChildren(...errors.map(error => {
+      const row = document.createElement("li");
+      row.textContent = `${new Date(error.at).toLocaleTimeString()} · HTTP ${error.status} · ${displayModel(error.model)}`;
+      row.title = error.sessionID ? infoOf(error.sessionID)?.title || error.sessionID : "Upstream HTTP response";
+      return row;
+    }));
+  });
+  const expandedAgents = new Set();
+  const expandedMetrics = new Set();
+  const controlNote = document.createElement('div');
+  controlNote.setAttribute('role','status');
+  sessionsBox.appendChild(controlNote);
 
   function renderSessions() {
+    const focusedGroup = sessionsList.contains(document.activeElement) && document.activeElement.dataset.agentGroup;
+    const focusedAction = sessionsList.contains(document.activeElement) && document.activeElement.dataset.sessionControl;
+    const focusedTitle = sessionsList.contains(document.activeElement) && document.activeElement.dataset.metricsFor;
     sessionsList.textContent = "";
     if (!sessions.length) {
       const empty = document.createElement("div");
@@ -396,25 +600,117 @@ function buildPanel(ui, endpoint, refreshMs, headingText, getSessionId, getTitle
     }
     const here = sessionId();
     const tbl = document.createElement("table");
+    sessionsList.classList.add('prism-sessions','prism-table-scroll');
     tbl.style.cssText = "width:100%;border-collapse:collapse;font-size:12px;user-select:text;-webkit-user-select:text;cursor:text";
     const head = document.createElement("tr");
+    head.className = 'prism-session-head';
     head.appendChild(th("Session", "left"));
     head.appendChild(th("Key", "center", "the key this session is pinned to; all its requests use that key's limits"));
     head.appendChild(th("Model", "left"));
     head.appendChild(th("Req", "right", "requests this session sent in the last minute / its key's per-minute cap for the model. Empty once the minute has passed."));
     head.appendChild(th("TPM", "right", "tokens this session used in the last minute, as a share of its key's per-minute token cap for the model. Empty once the minute has passed."));
-    head.appendChild(th("State", "left"));
+    head.appendChild(th("State", "left", "Running sessions, including nested subagents. Each session counts once."));
+    head.appendChild(th("Forecast", "right", "Estimated token budget for the next request, not billed usage"));
+    head.appendChild(th("Schedule", "left"));
     tbl.appendChild(head);
 
-    sessions.forEach((s, i) => {
-      const last = i === sessions.length - 1;
-      const tr = document.createElement("tr");
-      tr.title = s.id;
+    const nodes = new Map(sessions.map(s => [s.id, { id: s.id, usage: s, info: infoOf(s.id), children: [] }]));
+    const roots = [];
+    for (const node of nodes.values()) {
+      const parentID = node.info?.parentID || node.usage?.parentID;
+      if (!parentID || parentID === node.id || node.info?.fork) { roots.push(node); continue; }
+      if (!nodes.has(parentID)) nodes.set(parentID, { id: parentID, info: infoOf(parentID), children: [] });
+      nodes.get(parentID).children.push(node);
+    }
+    for (const id of expandedAgents) if (!nodes.get(id)?.children.length) expandedAgents.delete(id);
 
-      const title = titleOf(s.id) || `${s.id.slice(0, 8)}…${s.id.slice(-4)}`;
-      const name = td(title + (s.id === here ? "  · this one" : ""), "left", { last, strong: s.id === here, model: true });
-      name.title = s.id;
+    function sortSessions(list) {
+      for (const node of list) {
+        sortSessions(node.children);
+        const s = node.usage;
+        node.queued = (s?.queued || 0) + node.children.reduce((total,child) => total + child.queued, 0);
+        node.rank = s?.sending || (s?.active && !s?.heldBy) ? 0 : s?.heldBy ? 1 : 2;
+        node.size = s?.forecast || s?.contextTokens || Infinity;
+        const child = node.children[0];
+        if (child && (child.rank < node.rank || (child.rank === node.rank && child.size < node.size))) {
+          node.rank = child.rank; node.size = child.size;
+        }
+      }
+      list.sort((a,b) => a.rank - b.rank || a.size - b.size || a.id.localeCompare(b.id));
+    }
+    sortSessions(roots);
+
+    function appendSession(node, target, last) {
+      const s = node.usage;
+      const tr = document.createElement("tr");
+      tr.title = node.id;
+      tr.className = 'prism-session-row';
+
+      const title = node.info?.title || node.info?.name || `${node.id.slice(0, 8)}…${node.id.slice(-4)}`;
+      const name = td(title + (node.id === here ? "  · this one" : ""), "left", { last, strong: node.id === here, model: true });
+      name.className = 'prism-session-name';
+      const label = document.createElement('span');
+      label.className = 'prism-title';
+      label.textContent = name.textContent;
+      name.replaceChildren(label);
+      if (s) {
+        const toggle = document.createElement('button');
+        toggle.className = 'prism-title-toggle'; toggle.type = 'button'; toggle.dataset.metricsFor = node.id;
+        toggle.textContent = label.textContent;
+        toggle.title = `${title} — session details`;
+        function paintDetails(open) {
+          tr.toggleAttribute('data-expanded', open);
+          toggle.setAttribute('aria-expanded', String(open));
+        }
+        paintDetails(expandedMetrics.has(node.id));
+        toggle.onclick = () => {
+          const open = !expandedMetrics.has(node.id);
+          if (open) expandedMetrics.add(node.id); else expandedMetrics.delete(node.id);
+          paintDetails(open);
+        };
+        name.appendChild(toggle);
+      }
+      name.title = s?.contextTokens != null ? `${node.id}\nLast reported session context: ${s.contextTokens.toLocaleString()} tokens (input + output)` : node.id;
       tr.appendChild(name);
+      target.appendChild(tr);
+      if (s) appendSessionMetrics(tr, s, last);
+      else name.colSpan = 5;
+      let running = (s?.sending ?? s?.active) > 0 ? 1 : 0;
+      if (!node.children.length) {
+        appendState(tr, running, node, last);
+        return running;
+      }
+      const groupRow = target.insertRow();
+      const cell = groupRow.insertCell();
+      cell.className = 'prism-group-cell';
+      cell.colSpan = 8;
+      cell.style.paddingInlineStart = "12px";
+      const group = document.createElement("details");
+      group.className = "prism-unused";
+      const toggle = document.createElement("summary");
+      toggle.style.cssText = "cursor:pointer;padding:3px 0";
+      toggle.dataset.agentGroup = node.id;
+      toggle.textContent = `Subagents (${node.children.length})`;
+      group.open = expandedAgents.has(node.id);
+      group.ontoggle = () => {
+        if (!group.isConnected) return;
+        if (group.open) expandedAgents.add(node.id); else expandedAgents.delete(node.id);
+      };
+      const scroll = document.createElement("div");
+      scroll.style.cssText = "max-height:14rem;overflow:auto";
+      const subtable = document.createElement("table");
+      subtable.style.cssText = tbl.style.cssText;
+      subtable.setAttribute("aria-label", `Subagents of ${title}`);
+      subtable.appendChild(head.cloneNode(true));
+      node.children.forEach((child, i) => { running += appendSession(child, subtable, i === node.children.length - 1); });
+      scroll.appendChild(subtable);
+      group.append(toggle, scroll);
+      cell.appendChild(group);
+      appendState(tr, running, node, last);
+      return running;
+    }
+
+    function appendSessionMetrics(tr, s, last) {
 
       tr.appendChild(td(s.key ? `Key ${s.key}` : "no key", "center", { last, muted: !s.key, strong: s.active > 0 }));
 
@@ -446,23 +742,70 @@ function buildPanel(ui, endpoint, refreshMs, headingText, getSessionId, getTitle
           ? `this session: ${lim.tokens.toLocaleString()} of ${lim.tokenMax.toLocaleString()} tokens in the last ${Math.round(lim.tokenWindowMs / 1000)}s on Key ${s.key} (${s.model})\n` +
             `everyone on Key ${s.key}: ${lim.keyTokens.toLocaleString()} (${((lim.keyTokens / lim.tokenMax) * 100).toFixed(1)}%)`
           : "",
-      }));
+       }));
 
+      ['Key','Model','Requests','TPM'].forEach((label,i) => { tr.cells[i+1].dataset.metric = label; });
+
+    }
+
+    function appendState(tr, running, node, last) {
+      const s = node.usage;
       const state = td("", "left", { last });
-      if (s.active > 0) {
-        state.textContent = `● ${s.active} running`;
+      state.className = 'prism-session-state';
+      if (running > 0) {
+        state.textContent = `● ${running} running`;
         state.style.color = "rgb(80,170,110)";
         state.style.fontWeight = "650";
       } else {
-        state.textContent = `idle ${idleText(s.idleMs)}`;
+        state.textContent = s ? `idle ${idleText(s.idleMs)}` : "–";
         state.style.opacity = ".5";
       }
       state.style.fontVariantNumeric = "tabular-nums";
+      const heldBy = s?.heldBy || (node.children.find(c=>c.usage?.heldBy===node.id) ? node.id : null);
+      const flags = [];
+      if (heldBy) flags.push('Paused');
+      if (node.queued) flags.push(`${node.queued} queued`);
+      if (s?.next) flags.push('Next on this key');
+      if (s?.wait) flags.push(waitLabels[s.wait.reason] || 'Waiting for capacity');
+      if (s?.background) flags.push('Background');
+      if (flags.length) { state.textContent = (running ? `${running} running · ` : '') + flags.join(' · '); state.style.opacity = '1'; }
       tr.appendChild(state);
+      const forecast = td(s?.forecast ? fmt(s.forecast) : '–','right',{last});
+      forecast.dataset.metric = 'Forecast';
+      tr.appendChild(forecast);
+      if (s?.forecast && (s.active || s.queued)) {
+        const brief = document.createElement('span');
+        brief.className = 'prism-compact-forecast';
+        brief.textContent = ` · ${fmt(s.forecast)} forecast`;
+        state.appendChild(brief);
+      }
+      const action = td('', 'left', { last });
+      action.className = 'prism-session-action';
+      const button = document.createElement('button');
+      button.type = 'button'; button.className = 'prism-icon-action'; button.dataset.sessionControl = node.id;
+      const actionLabel = !heldBy ? 'Pause session and subagents' : heldBy === node.id ? 'Resume session and subagents' : 'Resume parent session and subagents';
+      button.setAttribute('aria-label', actionLabel);
+      button.title = heldBy ? actionLabel : `${actionLabel} — resumes automatically within 60s`;
+      const svg = document.createElementNS('http://www.w3.org/2000/svg','svg');
+      svg.setAttribute('viewBox','0 0 16 16'); svg.setAttribute('width','16'); svg.setAttribute('height','16'); svg.setAttribute('aria-hidden','true');
+      const path = document.createElementNS(svg.namespaceURI,'path');
+      path.setAttribute('fill','currentColor');
+      path.setAttribute('d', heldBy ? 'M5 3.3v9.4L12.4 8z' : 'M4 3h2.5v10H4zm5.5 0H12v10H9.5z');
+      svg.appendChild(path); button.appendChild(svg);
+      button.onclick = async () => {
+        button.disabled = true;
+        try { await control(heldBy ? 'resume' : 'pause', heldBy || node.id); controlNote.textContent = ''; await refresh(); }
+        catch { controlNote.textContent = 'Could not update scheduling. Try again.'; }
+        finally { button.disabled = false; }
+      };
+      action.appendChild(button); tr.appendChild(action);
 
-      tbl.appendChild(tr);
-    });
+    }
+    roots.forEach((node, i) => appendSession(node, tbl, i === roots.length - 1));
     sessionsList.appendChild(tbl);
+    if (focusedGroup) sessionsList.querySelector(`summary[data-agent-group="${CSS.escape(focusedGroup)}"]`)?.focus({ preventScroll: true });
+    if (focusedAction) sessionsList.querySelector(`button[data-session-control="${CSS.escape(focusedAction)}"]`)?.focus({preventScroll:true});
+    if (focusedTitle) sessionsList.querySelector(`button[data-metrics-for="${CSS.escape(focusedTitle)}"]`)?.focus({preventScroll:true});
   }
 
   renderSessions();
@@ -915,6 +1258,7 @@ function buildPanel(ui, endpoint, refreshMs, headingText, getSessionId, getTitle
     }
 
     table.textContent = "";
+    if (error || !data) { usedIds = null; showUnused(); }
     if (error) {
       for (const v of Object.values(cardValues)) v.textContent = "—";
       footer.textContent = "";
@@ -936,7 +1280,7 @@ function buildPanel(ui, endpoint, refreshMs, headingText, getSessionId, getTitle
     const w = selectedKey === "all"
       ? data.windows && data.windows[win]
       : (perKey ? perKey.total : { requests: 0, input: 0, output: 0, reasoning: 0, cached: 0, cost: 0 });
-    if (!w) { footer.textContent = "no data yet for " + win; return; }
+    if (!w) { usedIds = null; showUnused(); footer.textContent = "no data yet for " + win; return; }
 
     cardValues.requests.textContent = String(w.requests);
     const inputs = inputBreakdown(w);
@@ -953,20 +1297,11 @@ function buildPanel(ui, endpoint, refreshMs, headingText, getSessionId, getTitle
     table.appendChild(thead);
 
     const body = document.createElement("tbody");
-    // Every model the proxy knows a price for gets a row, so a model that has not
-    // been used in this window still shows up (with zeros) instead of being absent.
-    // Only models the proxy still offers get a row. A retired model (one the
-    // gateway no longer lists) has no price entry, so its history is not shown here.
-    const offered = data.pricing ? new Set(Object.keys(data.pricing)) : null;
-    const models = {};
     const rowsSrc = selectedKey === "all" ? ((data.models && data.models[win]) || {}) : (perKey ? perKey.models : {});
-    for (const [name, m] of Object.entries(rowsSrc)) {
-      if (!offered || offered.has(name)) models[name] = m;
-    }
-    for (const name of offered || []) {
-      if (!models[name]) models[name] = { requests: 0, input: 0, output: 0, reasoning: 0, cost: 0 };
-    }
-    const rows = Object.entries(models).sort((a, b) => (b[1].cost || 0) - (a[1].cost || 0) || (b[1].output || 0) - (a[1].output || 0));
+    const rows = Object.entries(rowsSrc || {}).filter(([, m]) => m.requests > 0)
+      .sort((a, b) => (b[1].cost || 0) - (a[1].cost || 0) || (b[1].output || 0) - (a[1].output || 0));
+    usedIds = new Set(rows.map(([id]) => id));
+    showUnused();
     for (const [name, m] of rows) {
       const tr = document.createElement("tr");
       // Model cell tooltip: the API id plus the rates used for the cost column.
@@ -1006,7 +1341,7 @@ function buildPanel(ui, endpoint, refreshMs, headingText, getSessionId, getTitle
     tr.appendChild(td(secs(w.avgMs), "right", { strong: true, last: true }));
     tr.appendChild(td(money(w.cost), "right", { strong: true, last: true }));
     tfoot.appendChild(tr);
-    table.appendChild(tfoot);
+    if (rows.length > 1) table.appendChild(tfoot);
 
     footer.textContent =
       `auto ${Math.round(refreshMs / 1000)}s · updated ${new Date(data.updated || Date.now()).toLocaleTimeString()}` +
@@ -1019,6 +1354,7 @@ function buildPanel(ui, endpoint, refreshMs, headingText, getSessionId, getTitle
   async function refresh() {
     if (!root.isConnected && Date.now() - born > 15000) { clearInterval(timer); return; }
     if (inFlight) return;
+    if (Date.now() >= catalogDue) void syncCatalog();
     inFlight = true;
     setRefreshing(true);
     try {
@@ -1084,7 +1420,7 @@ function buildPanel(ui, endpoint, refreshMs, headingText, getSessionId, getTitle
   }
 
   const timer = setInterval(refresh, refreshMs);
-  onCleanup(() => { clearInterval(timer); clearTimeout(copyTimer); });
+  onCleanup(() => { clearInterval(timer); clearTimeout(copyTimer); catalogAbort.abort(); });
   paint();
   refresh();
   return root;
@@ -1098,9 +1434,23 @@ module.exports = {
       const refreshMs = Math.max(1000, Number(ctx.options && ctx.options.refreshMs) || 5000);
       const key = `${ctx.id}:usage`;
       const statusUrl = endpoint.replace(/\/usage\/?$/, "/status");
+      const owner = crypto.randomUUID();
+      const control = (action,session) => ctx.client.rpc(schedulingRpc).control({action,session,owner});
+      let lastFocus, renewed = 0;
+      function publishFocus() {
+        const id = document.hasFocus() && !document.hidden ? ctx.sessions?.current()?.id : null;
+        if (!id && lastFocus) void control('unfocus',lastFocus).catch(()=>{});
+        if (id && (id !== lastFocus || Date.now()-renewed >= 5000)) {
+          renewed = Date.now(); void control('focus',id).catch(()=>{});
+        }
+        lastFocus = id;
+      }
+      window.addEventListener('blur',publishFocus);
+      window.addEventListener('focus',publishFocus);
 
       // Proxy retry state for the pill: poll /status once a second.
       const statusTimer = setInterval(async () => {
+        publishFocus();
         try {
           const r = await fetch(statusUrl, { cache: "no-store" });
           setProxyStatus(r.ok ? await r.json() : null);
@@ -1116,7 +1466,7 @@ module.exports = {
           const retry = proxyStatus()?.sessions?.[input.session.id];
           if (!retry) return undefined;
           return {
-            label: "Retrying request",
+            label: `Retrying · HTTP ${retry.status}`,
             icon: "status",
             tone: "warning",
             title: `${retry.model || "Request"} · HTTP ${retry.status} · retry ${retry.retries}`,
@@ -1166,8 +1516,8 @@ module.exports = {
           // session the server has, not just the one on screen.
           const s = ctx.sessions && ctx.sessions.current ? ctx.sessions.current() : null;
           const info = s && s.server && s.server.data && s.server.data.session && s.server.data.session.get(id);
-          return (info && (info.title || info.name)) || null;
-        }),
+          return info;
+        }, () => ctx.client.rpc(catalogRpc).sync({}), control),
       });
 
       ctx.add(MenuItem, () => ({
@@ -1188,6 +1538,8 @@ module.exports = {
 
       return () => {
         clearInterval(statusTimer);
+        window.removeEventListener('blur',publishFocus); window.removeEventListener('focus',publishFocus);
+        if(lastFocus) void control('unfocus',lastFocus).catch(()=>{});
       };
     },
   }),

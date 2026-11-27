@@ -26,6 +26,9 @@ import zlib from "node:zlib";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+const policyModule = new URL('./queue-policy.mjs', import.meta.url);
+if (globalThis.__prismHotReloading) policyModule.searchParams.set('reload', Date.now());
+const { requestWindow, chooseTicket } = await import(policyModule.href);
 
 // Set by hotReload() on the copy of this file that is being replaced. That copy
 // keeps finishing the requests it already has, but it must not write keys.json or
@@ -563,18 +566,49 @@ const GLOBAL_LIMITS = parseLimits(process.env.PRISM_PROXY_GLOBAL_LIMITS || GLOBA
 const GLOBAL_TOKEN_LIMITS = parseLimits(process.env.PRISM_PROXY_GLOBAL_TOKEN_LIMITS || GLOBAL_TOKEN_LIMITS_DEFAULT);
 const GLOBAL_LIMIT = GLOBAL_LIMITS.get("global") || GLOBAL_LIMITS.get("*") || null;
 const GLOBAL_TOKEN_LIMIT = GLOBAL_TOKEN_LIMITS.get("global") || GLOBAL_TOKEN_LIMITS.get("*") || null;
+const pacePercent = Number(process.env.PRISM_PROXY_PACE_START_PERCENT || 80);
+const GLOBAL_PACE_START = Number.isFinite(pacePercent) && pacePercent >= 0 && pacePercent <= 100 ? pacePercent / 100 : 0.8;
+
+// Forecast one rolling window with no further admissions. A reservation must
+// fit the hard cap AND either fit the soft budget or finish its pacing gap.
+function rollingWait(now, projected, cap, softCap, gapEnd, entries, windowMs, unit) {
+  if (!cap || projected <= softCap) return { ms: 0 };
+  let hardWait = 0, hardRelease = 0;
+  let softWait = Infinity, freed = 0;
+  for (let i = 0; i < entries.length; i++) {
+    const entry = entries[i];
+    const stamp = unit === "rpm" ? entry : entry.t;
+    freed += unit === "rpm" ? 1 : entry.n;
+    const next = entries[i + 1];
+    if (stamp === (unit === "rpm" ? next : next?.t)) continue;
+    const ms = stamp + windowMs - now;
+    if (!hardWait && projected > cap && projected - freed <= cap) {
+      hardWait = ms;
+      hardRelease = freed;
+    }
+    if (projected - freed <= softCap) { softWait = ms; break; }
+    if (projected - freed <= cap && stamp + windowMs >= gapEnd) break;
+  }
+  const pacedWait = Math.min(softWait, Math.max(0, Math.ceil(gapEnd - now)));
+  if (hardWait && hardWait >= pacedWait) return { ms: hardWait, reason: `${unit}-limit`, releaseAmount: hardRelease };
+  return { ms: pacedWait, reason: `${unit}-pacing`, releaseAmount: pacedWait === softWait ? freed : undefined };
+}
 
 class ModelLimiter {
-  constructor(model, max, windowMs, tokenMax, tokenWindowMs) {
+  constructor(model, max, windowMs, tokenMax, tokenWindowMs, paceStart = 1) {
     this.model = model;
     this.max = max;
     this.windowMs = windowMs;
     this.tokenMax = tokenMax;
     this.tokenWindowMs = tokenWindowMs;
+    this.paceStart = paceStart;
+    this.lastReservation = -Infinity;
     this.stamps = [];              // dispatch times inside the window
     this.tokens = [];              // { t, n } token reservations inside the window
+    this.queue = []; // Queued estimates, not usage reservations.
     this.blockedUntil = 0;         // set by an upstream 429
-    this.tail = Promise.resolve(); // FIFO reservation chain
+    this.queueTimer = null;
+    this.burstCredits = 2;
     this.total = 0;
     this.throttled = 0;
     this.retries = 0;
@@ -584,6 +618,7 @@ class ModelLimiter {
   prune(now) {
     const cutoff = now - this.windowMs;
     while (this.stamps.length && this.stamps[0] <= cutoff) this.stamps.shift();
+    if (this.stamps.length <= 23) this.burstCredits = 2;
     if (this.tokenMax > 0) {
       const tc = now - this.tokenWindowMs;
       while (this.tokens.length && this.tokens[0].t <= tc) this.tokens.shift();
@@ -596,35 +631,29 @@ class ModelLimiter {
     return n;
   }
 
-  // milliseconds the caller must wait; 0 means a slot is free now
-  waitTime(now, estTokens = 0) {
+  // Also used for non-queuing probes; only acquireLimiter publishes a live wait.
+  waitDecision(now, estTokens = 0, forecast = 0) {
     this.prune(now);
-    if (this.blockedUntil > now) return this.blockedUntil - now;
-    if (this.max > 0 && this.stamps.length >= this.max) {
-      return this.stamps[0] + this.windowMs - now;
+    let wait = { ms: Math.max(0, this.blockedUntil - now), reason: "upstream" };
+    if (this.max > 0) {
+      const policy = requestWindow(this, forecast);
+      const rpm = rollingWait(now, this.stamps.length + 1, policy.cap, policy.target * this.paceStart,
+        this.lastReservation + this.windowMs / policy.target, this.stamps, this.windowMs, "rpm");
+      if (rpm.ms > wait.ms) wait = rpm;
     }
     if (this.tokenMax > 0 && estTokens > 0) {
-      // A single request can exceed the whole budget (a huge compaction
-      // prompt). It must still be admitted, or it would wait forever: clamp
-      // the estimate to the budget and only queue behind existing traffic.
       const est = Math.min(estTokens, this.tokenMax);
-      const used = this.tokenSum();
-      if (used + est > this.tokenMax) {
-        // wait until enough of the oldest reservations age out
-        let need = used + est - this.tokenMax;
-        let acc = 0;
-        for (const e of this.tokens) {
-          acc += e.n;
-          if (acc >= need) return e.t + this.tokenWindowMs - now;
-        }
-        return this.tokenWindowMs;
-      }
+      const tpm = rollingWait(now, this.tokenSum() + est, this.tokenMax, this.tokenMax * this.paceStart,
+        this.lastReservation + this.tokenWindowMs * est / this.tokenMax, this.tokens, this.tokenWindowMs, "tpm");
+      if (tpm.ms > wait.ms) wait = tpm;
     }
-    return 0;
+    return wait;
   }
 
-  reserve(now, estTokens) {
+  reserve(now, estTokens, forecast = 0) {
     this.prune(now);
+    if (requestWindow(this, forecast).burst) this.burstCredits--;
+    this.lastReservation = now;
     if (this.max > 0) {
       this.stamps.push(now);
       this.total++;
@@ -635,6 +664,21 @@ class ModelLimiter {
       this.tokens.push(entry);
     }
     return entry;
+  }
+
+  sessionBudgetWait(now, candidate, peers) {
+    const usable = Math.floor(this.tokenMax * 0.8);
+    let forecast = candidate.budget;
+    for (const peer of peers) {
+      if (peer === candidate || peer.background !== candidate.background || peer.budget !== candidate.budget) continue;
+      if (forecast + peer.budget > usable) break;
+      forecast += peer.budget;
+    }
+    // A request larger than the usable share goes first on an empty window.
+    const needed = Math.min(usable, forecast) + this.tokenMax - usable;
+    const wait = rollingWait(now, this.tokenSum() + needed, this.tokenMax, this.tokenMax,
+      now, this.tokens, this.tokenWindowMs, "tpm");
+    return { ...wait, reason: "session-budget" };
   }
 
   // Replace a reservation's estimate with what the request actually used.
@@ -657,6 +701,7 @@ class ModelLimiter {
       tokenWindowMs: this.tokenWindowMs,
       tokensUsed: this.tokenSum(),
       blockedMs: Math.max(0, this.blockedUntil - now),
+      wait: this.activeWait?.until > now ? { reason: this.activeWait.reason, remainingMs: this.activeWait.until - now, releaseAmount: this.activeWait.releaseAmount } : null,
       total: this.total,
       throttled: this.throttled,
       retries: this.retries,
@@ -690,17 +735,18 @@ function limiterFor(model, slot = 0) {
   return lim;
 }
 
-function globalLimiterFor(slot = 0) {
-  if (!GLOBAL_LIMIT && !GLOBAL_TOKEN_LIMIT) return null;
+function globalLimiterFor(slot = 0, forSession = false) {
   const mapKey = slot ? `global|${slot}` : "global";
   let lim = globalLimiters.get(mapKey);
   if (lim) return lim;
+  if (!GLOBAL_LIMIT && !GLOBAL_TOKEN_LIMIT && !forSession) return null;
   lim = new ModelLimiter(
     "global",
     GLOBAL_LIMIT ? GLOBAL_LIMIT.max : 0,
     GLOBAL_LIMIT ? GLOBAL_LIMIT.windowMs : 60000,
     GLOBAL_TOKEN_LIMIT ? GLOBAL_TOKEN_LIMIT.max : 0,
     GLOBAL_TOKEN_LIMIT ? GLOBAL_TOKEN_LIMIT.windowMs : 60000,
+    GLOBAL_PACE_START,
   );
   globalLimiters.set(mapKey, lim);
   log(`global limiter ${mapKey} created (${lim.max}/${lim.windowMs / 1000}s, ${lim.tokenMax} tokens/${lim.tokenWindowMs / 1000}s)`);
@@ -711,65 +757,137 @@ function hasLimiter(model, slot = 0) {
   return !!(globalLimiterFor(slot) || limiterFor(model, slot));
 }
 
-// Strict FIFO: each caller awaits the previous reservation. Reservation is
-// instant, so this serializes slots rather than requests.
-//
-// With `maxWaitMs`, a caller gives up its place instead of waiting longer than
-// that and resolves `{ spill: true }` without reserving anything, so the caller
-// can send the request somewhere else (see the overflow rules below).
-function acquireLimiter(lim, label, estTokens = 0, maxWaitMs = 0, signal) {
-  if (!lim) return Promise.resolve(null);
-  const calledAt = Date.now();
-  let cancelled = false;
-  const run = lim.tail.then(async () => {
-    if (cancelled) return { spill: true };
-    const start = Date.now();
-    for (;;) {
-      if (signal?.aborted) return null;
-      if (cancelled) return { spill: true };
-      const now = Date.now();
-      const wait = lim.waitTime(now, estTokens);
-      if (wait > 0 && maxWaitMs > 0 && now + wait - calledAt > maxWaitMs) {
-        cancelled = true;
-        return { spill: true };
+function admissionWait(lim, ticket, now, peers = []) {
+  let wait = lim.waitDecision(now, ticket.estimate, ticket.budget);
+  if (ticket.modelLimiter) {
+    const modelWait = ticket.modelLimiter.waitDecision(now, ticket.estimate);
+    if (modelWait.ms > wait.ms) wait = modelWait;
+  }
+  if (ticket.budget && lim.tokenMax) {
+    const capacity = lim.sessionBudgetWait(now, ticket, peers);
+    if (capacity.ms > wait.ms) wait = capacity;
+  }
+  return wait;
+}
+
+function afterReservation(lim, first, now) {
+  const shadow = Object.assign(Object.create(ModelLimiter.prototype), lim, { stamps: lim.stamps.slice(), tokens: lim.tokens.slice() });
+  shadow.reserve(now, first.estimate, first.budget);
+  return shadow;
+}
+
+const holds = new Map();
+let focus = { session: null, until: 0 };
+const belongsTo = (t, id) => t.session === id || t.ancestors.includes(id);
+function refreshHolds(now) {
+  for (const [id, hold] of holds) {
+    if (now >= hold.until || (hold.quietSince != null && now - hold.quietSince >= 5000)) { holds.delete(id); continue; }
+    const competing = [...globalLimiters.values()].some(l => (l === hold.limiter || l.queue.some(t => belongsTo(t,id))) &&
+      l.queue.some(t => !belongsTo(t,id) && ![...holds.keys()].some(other => belongsTo(t,other))));
+    if (competing) hold.quietSince = null;
+    else if (hold.quietSince == null) hold.quietSince = now;
+  }
+}
+function holdFor(ticket) { return [ticket.session, ...ticket.ancestors].find(id => holds.has(id)); }
+
+// Check and reserve synchronously, so a bypass cannot oversubscribe a key.
+function pumpLimiter(lim) {
+  clearTimeout(lim.queueTimer);
+  lim.activeWait = null;
+  lim.nextTicket = null;
+  while (lim.queue.length) {
+    const now = Date.now();
+    refreshHolds(now);
+    const seen = new Set();
+    const peers = lim.queue.filter(t => {
+      if (holdFor(t)) { t.wasPaused = true; return false; }
+      if (t.wasPaused) {
+        t.wasPaused = false;
+        t.prioritySince = now;
+        t.passed = 0;
       }
-      if (wait <= 0) {
-        const entry = lim.reserve(now, estTokens);
-        const waited = now - start;
-        if (waited > 0) {
-          lim.throttled++;
-          if (waited > QUEUE_LOG_MS) {
-            log(`throttled ${label} for ${(waited / 1000).toFixed(1)}s (${lim.max}/${lim.windowMs / 1000}s` +
-              `${lim.tokenMax > 0 ? `, ${lim.tokenSum()}/${lim.tokenMax} tokens` : ""})`);
-          }
-        }
-        return { limiter: lim, entry };
-      }
-      await waitForRetry(Math.min(wait, 1000), signal);
+      if (seen.has(t.session)) return false;
+      seen.add(t.session);
+      return true;
+    });
+    const candidates = peers.map(ticket => ({ ticket, wait: admissionWait(lim, ticket, now, peers) }));
+    const expired = candidates.find(c => now + c.wait.ms > c.ticket.deadline);
+    if (expired) { lim.queue.splice(lim.queue.indexOf(expired.ticket), 1); expired.ticket.finish({ spill: true }); continue; }
+    const selected = chooseTicket(candidates, {
+      now, focused: focus.until > now ? focus.session : null,
+      waitAfter(first, later) {
+        const other = { ...later };
+        if (first.modelLimiter && first.modelLimiter === later.modelLimiter) other.modelLimiter = afterReservation(first.modelLimiter, first, now);
+        return admissionWait(afterReservation(lim, first, now), other, now).ms;
+      },
+      fitBoth(a,b) {
+        const after = afterReservation(lim, a, now);
+        const policy = requestWindow(after, b.budget);
+        const sharedModel = a.modelLimiter && a.modelLimiter === b.modelLimiter ? a.modelLimiter : null;
+        if (sharedModel?.max && sharedModel.stamps.length + 2 > sharedModel.max) return false;
+        if (sharedModel?.tokenMax && sharedModel.tokenSum() + a.estimate + b.estimate > sharedModel.tokenMax) return false;
+        return (!lim.max || after.stamps.length + 1 <= policy.cap) &&
+          (!lim.tokenMax || lim.tokenSum() + a.budget + b.budget <= lim.tokenMax * 0.8);
+      },
+    });
+    if (!selected) {
+      const next = candidates.filter(c => c.wait.ms > 0).sort((a,b)=>a.wait.ms-b.wait.ms)[0];
+      lim.nextTicket = next?.ticket;
+      if (next) lim.activeWait = { ...next.wait, until: now + next.wait.ms };
+      lim.queueTimer = setTimeout(() => pumpLimiter(lim), Math.min(next?.wait.ms || 1000, 1000));
+      return;
     }
-  });
-  lim.tail = run.catch(() => {});
-  if (!maxWaitMs) return run;
-  // Also leave the queue at the deadline even when whoever is ahead of us is
-  // still waiting, so one slow caller cannot hold the others past their limit.
+    const index = lim.queue.indexOf(selected.ticket);
+    for (const c of candidates) { if (lim.queue.indexOf(c.ticket) < index) c.ticket.passed++; }
+    const [ticket] = lim.queue.splice(index, 1);
+    const entry = lim.reserve(now, ticket.estimate, ticket.budget);
+    const model = ticket.modelLimiter ? { limiter: ticket.modelLimiter, entry:ticket.modelLimiter.reserve(now,ticket.estimate) } : null;
+    const waited = now - ticket.arrived;
+    if (waited > 0) lim.throttled++;
+    if (waited > QUEUE_LOG_MS) log(`throttled ${ticket.label} for ${(waited / 1000).toFixed(1)}s (${lim.max}/${lim.windowMs / 1000}s, ${lim.tokenSum()}/${lim.tokenMax} tokens)`);
+    ticket.finish({ limiter: lim, entry, model });
+  }
+  refreshHolds(Date.now());
+}
+
+function acquireLimiter(lim, label, estTokens = 0, maxWaitMs = 0, signal, sessionBudget = 0, session, policy = {}, modelLimiter) {
+  if (!lim) return Promise.resolve(null);
+  if (signal?.aborted) return Promise.resolve(null);
   return new Promise((resolve) => {
-    const timer = setTimeout(() => { cancelled = true; resolve({ spill: true }); }, maxWaitMs);
-    run.then((v) => { clearTimeout(timer); resolve(v); }, () => { clearTimeout(timer); resolve({ spill: true }); });
+    let timer;
+    const arrived = Date.now();
+    const ticket = { label, estimate: estTokens, budget: sessionBudget, session, arrived, passed: 0,
+      modelLimiter, background: !!policy.background, ancestors: policy.ancestors || [],
+      deadline: maxWaitMs ? arrived + maxWaitMs : Infinity,
+      finish(result) { clearTimeout(timer); signal?.removeEventListener('abort', abort); resolve(result); },
+    };
+    function leave(result) {
+      const i = lim.queue.indexOf(ticket);
+      if (i < 0) return;
+      lim.queue.splice(i, 1);
+      ticket.finish(result);
+      pumpLimiter(lim);
+    }
+    const abort = () => leave(null);
+    signal?.addEventListener('abort', abort, { once: true });
+    if (maxWaitMs) timer = setTimeout(() => leave({ spill: true }), maxWaitMs);
+    refreshHolds(arrived);
+    lim.queue.push(ticket);
+    pumpLimiter(lim);
   });
 }
 
-// Every request takes a slot in the key's global window first, then in its
-// per-model window when one is configured. The returned reservation keeps both
-// entries so usage reconciliation updates both budgets.
-function acquire(model, estTokens = 0, maxWaitMs = 0, slot = 0, signal) {
-  const global = globalLimiterFor(slot);
+// Check and reserve both windows in one queue decision; a paused or model-
+// blocked request must not consume the key-wide slot before it can dispatch.
+function acquire(model, estTokens = 0, maxWaitMs = 0, slot = 0, signal, sessionBudget = 0, session, policy) {
+  const global = globalLimiterFor(slot, !!session);
   const modelLim = limiterFor(model, slot);
   if (!global && !modelLim) return Promise.resolve(null);
   return (async () => {
-    const globalRes = await acquireLimiter(global, "global", estTokens, maxWaitMs, signal);
+    const globalRes = await acquireLimiter(global, "global", estTokens, maxWaitMs, signal, sessionBudget, session, policy, modelLim);
     if (signal?.aborted) return null;
     if (globalRes && globalRes.spill) return globalRes;
-    const modelRes = await acquireLimiter(modelLim, model, estTokens, maxWaitMs, signal);
+    const modelRes = globalRes ? globalRes.model : await acquireLimiter(modelLim, model, estTokens, maxWaitMs, signal, 0, session, policy);
     if (signal?.aborted) return null;
     if (modelRes && modelRes.spill) return modelRes;
     return {
@@ -1037,6 +1155,7 @@ function pickKey(sessionId) {
 
 function keysReport() {
   const now = Date.now();
+  refreshHolds(now);
   const pins = {};
   for (const [sid, slot] of sessionKeyPins) pins[sid] = slot;
   const live = liveSessionCounts();
@@ -1050,7 +1169,9 @@ function keysReport() {
     // How much of the key's request cap on this model the session itself used in
     // the current window, next to what every session on that key used together.
     let limit = null;
-    const lim = slot ? (globalLimiterFor(slot) || (a.model ? limiterFor(a.model, slot) : null)) : null;
+    const lim = globalLimiterFor(slot) || (a.model ? limiterFor(a.model, slot) : null);
+    const queued = lim?.queue.filter(ticket => ticket.session === id) || [];
+    const heldBy = [id, ...(a.ancestors || [])].find(parent => holds.has(parent));
     if (lim && (lim.max > 0 || lim.tokenMax > 0)) {
       const snap = lim.snapshot(now);
       // A session can run on different models. Each slot records the model it was
@@ -1068,6 +1189,14 @@ function keysReport() {
       id,
       key: slot,
       limit,
+      contextTokens: a.contextTokens ?? null,
+      forecast: queued[0]?.budget || a.forecast || null,
+      queued: queued.length, sending: Math.max(0, a.active - queued.length),
+      next: !!queued[0] && lim.nextTicket === queued[0],
+      wait: lim?.nextTicket && queued.includes(lim.nextTicket) ? lim.snapshot(now).wait : null,
+      background: queued[0]?.background ?? (a.active > 0 && a.background),
+      heldBy, holdUntil: holds.get(heldBy)?.until,
+      parentID: a.ancestors?.[0],
       active: a.active,
       requests: a.requests,
       model: a.model,
@@ -1118,7 +1247,7 @@ async function pingModel(model, auth, pingSlot = 0) {
     try { reservation = await acquire(model, estTokens, PING_MAX_WAIT_MS, slot); } finally { PROXY_STATE.queued--; }
     queueMs = Date.now() - started;
     if (reservation && reservation.spill) {
-      const waitMs = lim.waitTime(Date.now(), estTokens);
+      const waitMs = lim.waitDecision(Date.now(), estTokens).ms;
       return { model, ok: false, skipped: true, queueMs, ms: Date.now() - started, error: `no free slot within ${Math.round(PING_MAX_WAIT_MS / 1000)}s, next in ${Math.ceil(waitMs / 1000)}s` };
     }
   }
@@ -1274,7 +1403,7 @@ function targetMatches(model) {
 }
 
 // One non-streaming vision call against the same upstream and credentials.
-async function analyzeImage({ auth, url, slot = 0 }) {
+async function analyzeImage({ auth, url, slot = 0, session, policy, signal }) {
   const payload = {
     model: VISION_MODEL,
     stream: false,
@@ -1291,7 +1420,8 @@ async function analyzeImage({ auth, url, slot = 0 }) {
   let lastErr = null;
   for (let attempt = 1; attempt <= 3; attempt++) {
     try {
-      await acquire(VISION_MODEL, 0, 0, slot);
+      await acquire(VISION_MODEL, 0, 0, slot, signal, 0, session, policy);
+      if (signal?.aborted) throw new Error('Request canceled');
       const res = await postJson("/chat/completions", headers, payload);
       if (res.status >= 400) {
         lastErr = new Error(`vision status ${res.status}: ${res.text.slice(0, 200)}`);
@@ -1315,7 +1445,7 @@ async function analyzeImage({ auth, url, slot = 0 }) {
 
 // Replace every image part in `rawBody` with its caption. Returns the original
 // buffer untouched when the model is not a configured target.
-async function visionHandoff(rawBody, model, auth, force = false, slot = 0) {
+async function visionHandoff(rawBody, model, auth, force = false, slot = 0, session, policy, signal) {
   if (!VISION_ENABLED || !model || model === VISION_MODEL) return rawBody;
   if (!force && !targetMatches(model)) return rawBody;
 
@@ -1342,7 +1472,7 @@ async function visionHandoff(rawBody, model, auth, force = false, slot = 0) {
       cached++;
     } else {
       try {
-        desc = await analyzeImage({ auth, url: img.url, slot });
+        desc = await analyzeImage({ auth, url: img.url, slot, session, policy, signal });
         visionCacheSet(key, desc);
         analyzed++;
       } catch (e) {
@@ -1373,6 +1503,12 @@ const PROXY_STATE = { active: 0, queued: 0, started: Date.now(), requests: 0, re
 // Live retry state per OpenCode session, for the composer pill. Keyed by the
 // x-opencode-session-id header OpenCode sends with every request.
 const sessionRetries = new Map();
+const recentErrors = [];
+function recordHttpError(status, model, req) {
+  if (!(status >= 400)) return;
+  recentErrors.unshift({ at: Date.now(), status, model, sessionID: req.headers['x-opencode-session-id'] || req.headers['x-opencode-session'] || null });
+  if (recentErrors.length > 20) recentErrors.pop();
+}
 
 function noteSessionRetry(sessionId, status, model) {
   if (!sessionId) return;
@@ -1515,10 +1651,12 @@ function parseRetryAfterMs(headers) {
   return null;
 }
 
+const GATEWAY_RETRY_DELAYS_MS = [1000, 5000, 10000];
 async function waitForBadGateway(model, count, { headers, gatewayError }, signal, sessionId) {
   const backoff = Math.min(500 * 2 ** Math.min(count - 1, 5), 15000);
   const retryAfter = parseRetryAfterMs(headers);
-  const wait = retryAfter > 0 ? Math.min(RETRY_AFTER_CAP_MS, Math.max(500, retryAfter)) : backoff;
+  const resetWait = retryAfter > 0 ? Math.min(RETRY_AFTER_CAP_MS, Math.max(500, retryAfter)) : backoff;
+  const wait = gatewayError === "502" ? GATEWAY_RETRY_DELAYS_MS[Math.min(count, GATEWAY_RETRY_DELAYS_MS.length) - 1] : resetWait;
   PROXY_STATE.retries5xx = (PROXY_STATE.retries5xx || 0) + 1;
   noteSessionRetry(sessionId, 502, model);
   log(`upstream ${gatewayError} for ${model}; retrying in ${wait / 1000}s (gateway retry ${count})`);
@@ -1607,6 +1745,21 @@ async function handle(req, res) {
   // Replace the running code with the current index.js, no service restart. The
   // custom header makes this a non-simple request, so a web page cannot trigger
   // it: our CORS preflight does not allow the header.
+  if (req.method === "POST" && url.pathname === "/admin/scheduling") {
+    if (req.headers['x-prism-admin'] !== '1') return sendJson(res,403,'{"error":"local control header required"}');
+    let command;
+    try { command = JSON.parse(await readBody(req)); } catch { return sendJson(res,400,'{"error":"invalid command"}'); }
+    const {action,session,owner} = command || {};
+    if (typeof session !== 'string' || !/^[\w-]{1,150}$/.test(session)) return sendJson(res,400,'{"error":"invalid session"}');
+    const now = Date.now();
+    if (action === 'focus') focus = { session, owner, until: now + 12000 };
+    else if (action === 'unfocus') { if (focus.owner === owner && focus.session === session) focus = { session:null, until:0 }; }
+    else if (action === 'pause') holds.set(session,{ until:now+60000, quietSince:now, limiter:globalLimiters.get(sessionKeyPins.get(session) ? `global|${sessionKeyPins.get(session)}` : 'global') });
+    else if (action === 'resume') holds.delete(session);
+    else return sendJson(res,400,'{"error":"invalid action"}');
+    for (const lim of [...globalLimiters.values(),...limiters.values()]) if (lim.queue.length) pumpLimiter(lim);
+    return sendJson(res,200,'{"ok":true}');
+  }
   if (req.method === "POST" && url.pathname === "/admin/reload") {
     if (req.headers["x-prism-admin"] !== "1") {
       return sendJson(res, 403, JSON.stringify({ error: "send the x-prism-admin: 1 header" }));
@@ -1759,6 +1912,7 @@ async function handle(req, res) {
         active: overflowReport(now),
       },
       sessions: sessionRetryReport(now),
+      recentErrors,
       retries5xx: PROXY_STATE.retries5xx || 0,
       compaction: {
         enabled: COMPACTION_ENABLED,
@@ -1769,6 +1923,7 @@ async function handle(req, res) {
       keys: accountKeys,
       // Account totals: the per-key caps times the configured key count.
       globalLimits: {
+        paceStartPercent: Math.round(GLOBAL_PACE_START * 10000) / 100,
         requests: GLOBAL_LIMIT ? `${GLOBAL_LIMIT.max * accountKeys}/${GLOBAL_LIMIT.windowMs / 1000}s` : "off",
         tokens: GLOBAL_TOKEN_LIMIT ? `${GLOBAL_TOKEN_LIMIT.max * accountKeys}/${GLOBAL_TOKEN_LIMIT.windowMs / 1000}s` : "off",
       },
@@ -1802,6 +1957,7 @@ async function handle(req, res) {
     } catch { return sendJson(res, 400, '{"error":{"message":"Invalid multipart image request"}}'); }
   }
   const sessionId = req.headers["x-opencode-session-id"] || req.headers["x-opencode-session"] || null;
+  const policy = { background:req.headers['x-prism-priority'] === 'background', ancestors:String(req.headers['x-prism-ancestors'] || '').split(',').filter(Boolean).slice(0,64) };
   // With a key pool configured, this request goes out on the key its session is
   // pinned to, and follows that key's windows rather than the shared ones.
   const keySlot = keySlotForSession(sessionId);
@@ -1818,7 +1974,7 @@ async function handle(req, res) {
   let spill = null; // { target, from } while this request is served by a fallback
   // Mark the session live, with a request in flight, for the panel's session list.
   const sessionAct = sessionId ? touchSession(sessionId, model) : null;
-  if (sessionAct) sessionAct.active++;
+  if (sessionAct) { sessionAct.active++; sessionAct.ancestors = policy.ancestors; sessionAct.background = policy.background; }
   try {
     if (req.headers.authorization) lastAuthHeader = req.headers.authorization;
     if (isChat) body = trimOldImages(body);
@@ -1833,7 +1989,7 @@ async function handle(req, res) {
       }
     }
     if (isChat && model) {
-      body = await visionHandoff(body, model, req.headers.authorization, false, keySlot);
+      body = await visionHandoff(body, model, req.headers.authorization, false, keySlot, sessionId, policy, signal);
       const after = readRequest(body);
       if (after.model) meta = after;
       model = after.model || model;
@@ -1844,7 +2000,7 @@ async function handle(req, res) {
     // fallback model if the provider blocks the summary.
     if (isChat && model && looksLikeCompaction(meta)) {
       await deferWhileBusy(model, signal);
-      return await runCompaction(req, res, url, body, model, keySlot, signal);
+      return await runCompaction(req, res, url, body, model, keySlot, signal, policy);
     }
 
     let estTokens = estimateTokens(body, meta.maxTokens);
@@ -1884,10 +2040,12 @@ async function handle(req, res) {
     const budgetStart = Date.now();
     const reserveAttempt = async (maxWaitMs) => {
       PROXY_STATE.queued++;
-      try { return await acquire(model, estTokens, maxWaitMs, keySlot, signal); } finally { PROXY_STATE.queued--; }
+      const budget = textRequest ? forecastSessionTokens(sessionAct, estTokens, meta.maxTokens) : 0;
+      if (sessionAct) sessionAct.forecast = budget;
+      try { return await acquire(model, estTokens, maxWaitMs, keySlot, signal, budget, sessionId, policy); } finally { PROXY_STATE.queued--; }
     };
     while (!signal.aborted && !res.writableEnded) {
-      if ((textRequest || isImage) && model && hasLimiter(model, keySlot)) {
+      if ((textRequest || isImage) && model && (sessionId || hasLimiter(model, keySlot))) {
         const rule = !gatewayAttempts && !spilledFrom && OVERFLOW.get(model);
         reservation = await reserveAttempt(rule ? rule.maxWaitMs : 0);
         if (reservation?.spill) {
@@ -1913,6 +2071,7 @@ async function handle(req, res) {
       gatewayAttempts = 0;
       if (result.done) {
         const tokens = recordUsage(model, result, Date.now() - started, keySlot, isImage);
+        if (textRequest && sessionAct && tokens > 0) sessionAct.contextTokens = tokens;
         const measured = tokens ?? estTokens + Math.ceil((isImage ? 0 : result.bytes || 0) / 4);
         // The gateway can meter the admission estimate even when the reply uses fewer tokens.
         reconcileTokens(reservation, Math.max(estTokens, measured), 0);
@@ -1921,7 +2080,7 @@ async function handle(req, res) {
       if (result.visionFallback) {
         imageFallback = false;
         log(`upstream rejected an image request for ${model} (400); retrying with captions :: ${String(result.text).replace(/\s+/g, " ").slice(0, 160)}`);
-        body = await visionHandoff(body, model, req.headers.authorization, true, keySlot);
+        body = await visionHandoff(body, model, req.headers.authorization, true, keySlot, sessionId, policy, signal);
         estTokens = estimateTokens(body, meta.maxTokens);
         continue;
       }
@@ -2012,6 +2171,7 @@ function forward(req, res, url, body, model, isChat, opts = {}) {
 
     up.on("response", (rawRes) => {
       const status = rawRes.statusCode || 502;
+      recordHttpError(status, model, req);
       if (status === 502 && opts.retry5xx) {
         finish({ gatewayError: "502", headers: rawRes.headers });
         rawRes.destroy();
@@ -2153,6 +2313,12 @@ function estimateTokens(body, maxOutput) {
   if (text.includes("data:")) text = text.replace(/data:[^"\\]+/g, "data:image");
   const outputBudget = Number.isSafeInteger(maxOutput) && maxOutput > 0 ? maxOutput : 0;
   return Math.ceil(text.length / 4) + outputBudget;
+}
+
+function forecastSessionTokens(activity, estimate, maxOutput) {
+  if (!activity) return 0;
+  const output = Number.isSafeInteger(maxOutput) && maxOutput > 0 ? maxOutput : 0;
+  return 2 * Math.max(activity.contextTokens || 0, estimate - output) + output;
 }
 
 // Wait until no other request is in flight. The compaction request is the one
@@ -2317,6 +2483,7 @@ function forwardBuffered(req, url, body, model, signal) {
     up.on("error", failTransport);
     up.on("response", (upRes) => {
       if (upRes.statusCode === 502) {
+        recordHttpError(502, model, req);
         resolve({ gatewayError: "502", headers: upRes.headers });
         upRes.destroy();
         return;
@@ -2325,6 +2492,7 @@ function forwardBuffered(req, url, body, model, signal) {
       let size = 0;
       upRes.on("data", (c) => { chunks.push(c); size += c.length; });
       upRes.on("end", () => {
+        recordHttpError(upRes.statusCode, model, req);
         const text = Buffer.concat(chunks, size).toString("utf8");
         const hdrs = { ...upRes.headers };
         resolve({
@@ -2379,7 +2547,7 @@ function writeBuffered(res, r) {
 }
 
 // Runs compaction on the original model, then the handoff model if refused.
-async function runCompaction(req, res, url, body, model, slot, signal) {
+async function runCompaction(req, res, url, body, model, slot, signal, policy) {
   let estTokens = estimateTokens(body);
   // A compaction request can be larger than the model's context: the whole
   // conversation is sent to summarize. Trim it to the most recent messages
@@ -2395,13 +2563,15 @@ async function runCompaction(req, res, url, body, model, slot, signal) {
   }
   const sessionId = req.headers["x-opencode-session-id"] || req.headers["x-opencode-session"];
   const dispatch = async (target, payload) => {
-    const tokens = estimateTokens(payload, readRequest(payload).maxTokens);
+    const maxOutput = readRequest(payload).maxTokens;
+    const tokens = estimateTokens(payload, maxOutput);
+    const budget = forecastSessionTokens(sessionActivity.get(sessionId), tokens, maxOutput);
     let gatewayAttempts = 0;
     while (!signal.aborted) {
       let reservation = null;
-      if (hasLimiter(target, slot)) {
+      if (sessionId || hasLimiter(target, slot)) {
         PROXY_STATE.queued++;
-        try { reservation = await acquire(target, tokens, 0, slot, signal); } finally { PROXY_STATE.queued--; }
+        try { reservation = await acquire(target, tokens, 0, slot, signal, budget, sessionId, policy); } finally { PROXY_STATE.queued--; }
       }
       if (signal.aborted) return null;
       const r = await forwardBuffered(req, url, payload, target, signal);
