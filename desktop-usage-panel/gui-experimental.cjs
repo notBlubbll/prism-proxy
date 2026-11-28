@@ -258,7 +258,7 @@ function buildPanel(ui, endpoint, refreshMs, headingText, getSessionId, getSessi
     const b = document.createElement("button");
     b.type = "button";
     b.textContent = w === "24u" ? "Today" : w === "all" ? "All" : w;
-    if (w === "24u") b.title = "Since midnight UTC";
+    if (w === "24u") b.title = "Since local midnight";
     if (w === "24h") b.title = "Last 24 hours";
     b.className = "prism-range";
     b.onclick = (event) => {

@@ -472,8 +472,8 @@ function usageReport() {
   const now = Date.now();
   const d = new Date(now);
   const windows = {
-    // 24u is UTC midnight to now; 24h is the rolling last 24 hours.
-    "24u": Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()),
+    // 24u is local midnight to now; 24h is the rolling last 24 hours.
+    "24u": new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime(),
     "24h": now - 24 * 60 * 60 * 1000,
     "7d": now - 7 * 24 * 60 * 60 * 1000,
     "30d": now - 30 * 24 * 60 * 60 * 1000,
