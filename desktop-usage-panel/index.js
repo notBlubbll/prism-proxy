@@ -32,6 +32,25 @@ const schedulingRpc = { id: "prism-usage.scheduling", events: {}, methods: {
   control: { input: { type:"object", required:["action","session"], properties:{ action:{enum:["focus","unfocus","pause","resume"]}, session:{type:"string"}, owner:{type:"string"} }, additionalProperties:false }, output:{type:"boolean"} },
 } };
 
+// Confirmed live against the real upstream (2026-11-28): bare "-N" Claude IDs on
+// this gateway (no minor-version digit, e.g. "claude-sonnet-5") reject the classic
+// `thinking: {type:"enabled", budget_tokens}` request OpenCode sends by default for
+// Claude 5.0 and below ("thinking.type.enabled is not supported for this model. Use
+// thinking.type.adaptive and output_config.effort..."). `low`, `medium`, `high` and
+// `max` effort all returned 200 directly against /v1/messages with
+// {type:"adaptive"} + output_config.effort. OpenCode's own detection for the
+// effort-update/adaptive code path looks for "Claude Opus 5, Claude 5.1 and later"
+// by parsing the ID's version digits, so a bare "-5" id with no minor version can
+// fall on the wrong side of that check; compatibility.supportsEffortUpdates forces
+// the correct path regardless of how that detection reads this exact id.
+// "claude-sonnet-5" (bare major version) qualifies; "claude-opus-4-5" (major-minor
+// pair, e.g. Opus "4.5") does not — only the latter has evidence of needing the
+// classic style, and we have none that the bare-major form also does.
+function isAdaptiveThinkingId(id) {
+  return /-\d+$/.test(id) && !/-\d+-\d+$/.test(id);
+}
+const ADAPTIVE_THINKING_EFFORTS = ["low", "medium", "high", "max"];
+
 async function setupScheduling(ctx, endpoint) {
   await ctx.rpc.register(schedulingRpc, { async control(command) {
     if (!["127.0.0.1", "localhost", "[::1]"].includes(endpoint.hostname)) throw new Error("Session scheduling requires a local proxy");
@@ -128,6 +147,21 @@ export default {
             model.capabilities = structuredClone(template.capabilities);
           }
           if (adapter === RESPONSES) model.settings = { ...model.settings, reasoningSummary: "detailed" };
+          if (adapter === MESSAGES && isAdaptiveThinkingId(id)) {
+            model.compatibility = { ...model.compatibility, supportsEffortUpdates: true };
+            model.capabilities = { ...model.capabilities, reasoning: { supported: true, effort: ADAPTIVE_THINKING_EFFORTS } };
+            // display defaults to "omitted" on Claude Sonnet 5 and later adaptive-thinking
+            // models, which returns thinking blocks with an empty `thinking` field (only
+            // the opaque `signature` is populated, even though reasoning tokens are spent
+            // and billed). "summarized" is required to get back readable thinking text.
+            model.settings = { ...model.settings, thinking: { type: "adaptive", display: "summarized" } };
+            // capabilities.reasoning drives auto-built variants only for models with
+            // a backing provider template; a model discovered and created purely
+            // through this plugin has none, so the variants are declared explicitly
+            // here. Confirmed live: reasoningEffort reaches output_config.effort for
+            // this protocol once compatibility.supportsEffortUpdates is set above.
+            model.variants = ADAPTIVE_THINKING_EFFORTS.map(effort => ({ id: effort, settings: { reasoningEffort: effort } }));
+          }
         });
       }
     });
