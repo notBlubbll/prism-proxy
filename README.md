@@ -83,6 +83,14 @@ completions endpoint rejects function tools combined with reasoning
 Responses API accepts them. Responses-only models (`gpt-5*-codex`,
 `gpt-5*-pro`) can be added to the `models` map as well.
 
+Bare-major Claude IDs (`claude-sonnet-5`) reject the classic
+`thinking: {type:"enabled"}` request. The usage panel's catalog transform gives
+them `thinking: {type:"adaptive", display:"summarized"}`, marks them as
+supporting per-turn effort, and adds `low`/`medium`/`high`/`xhigh`/`max`
+variants. It does this for models already present in the config too, since a
+bare-major model without the adaptive shape fails with
+`output_config.effort requires a model that supports per-turn effort`.
+
 If a text endpoint returns HTTP 502 or its connection resets before any response
 bytes reach the client, the proxy waits and retries the same request. For HTTP 502
 the delay is 1 second, then 5 seconds, then 10 seconds between subsequent attempts.
