@@ -35,21 +35,40 @@ const schedulingRpc = { id: "prism-usage.scheduling", events: {}, methods: {
 // Confirmed live against the real upstream (2026-11-28): bare "-N" Claude IDs on
 // this gateway (no minor-version digit, e.g. "claude-sonnet-5") reject the classic
 // `thinking: {type:"enabled", budget_tokens}` request OpenCode sends by default for
-// Claude 5.0 and below ("thinking.type.enabled is not supported for this model. Use
-// thinking.type.adaptive and output_config.effort..."). `low`, `medium`, `high` and
-// `max` effort all returned 200 directly against /v1/messages with
-// {type:"adaptive"} + output_config.effort. OpenCode's own detection for the
-// effort-update/adaptive code path looks for "Claude Opus 5, Claude 5.1 and later"
-// by parsing the ID's version digits, so a bare "-5" id with no minor version can
-// fall on the wrong side of that check; compatibility.supportsEffortUpdates forces
-// the correct path regardless of how that detection reads this exact id.
+// Claude 5.0 and below. They require `thinking: {type:"adaptive"}` instead, and the
+// gateway rejects `output_config.effort` without it ("output_config.effort requires
+// a model that supports per-turn effort; this model does not"). Every effort level
+// the gateway accepts returned 200 with adaptive thinking: low, medium, high, xhigh
+// and max. OpenCode's own detection for the effort-update/adaptive code path looks
+// for "Claude Opus 5, Claude 5.1 and later" by parsing the ID's version digits, so a
+// bare "-5" id with no minor version can fall on the wrong side of that check;
+// compatibility.supportsEffortUpdates forces the correct path regardless of how
+// that detection reads this exact id.
 // "claude-sonnet-5" (bare major version) qualifies; "claude-opus-4-5" (major-minor
 // pair, e.g. Opus "4.5") does not — only the latter has evidence of needing the
 // classic style, and we have none that the bare-major form also does.
 function isAdaptiveThinkingId(id) {
   return /-\d+$/.test(id) && !/-\d+-\d+$/.test(id);
 }
-const ADAPTIVE_THINKING_EFFORTS = ["low", "medium", "high", "max"];
+const ADAPTIVE_THINKING_EFFORTS = ["low", "medium", "high", "xhigh", "max"];
+
+// display defaults to "omitted" on these models, which returns thinking blocks with
+// an empty `thinking` field (only the opaque `signature` is populated) even though
+// reasoning tokens are spent and billed. "summarized" is required to get back
+// readable thinking text. Models that already exist in the user's config keep their
+// metadata, but they still need this shape: the transform used to skip them, which
+// left them on the classic thinking.enabled path that the gateway rejects.
+function applyAdaptiveThinking(model) {
+  model.compatibility = { ...model.compatibility, supportsEffortUpdates: true };
+  model.capabilities = { ...model.capabilities, reasoning: { supported: true, effort: ADAPTIVE_THINKING_EFFORTS } };
+  model.settings = { ...model.settings, thinking: { type: "adaptive", display: "summarized" } };
+  // capabilities.reasoning drives auto-built variants only for models with a backing
+  // provider template; a model discovered and created purely through this plugin has
+  // none, so the variants are declared explicitly here. Confirmed live: reasoningEffort
+  // reaches output_config.effort for this protocol once compatibility.supportsEffortUpdates
+  // is set above.
+  model.variants = ADAPTIVE_THINKING_EFFORTS.map(effort => ({ id: effort, settings: { reasoningEffort: effort } }));
+}
 
 async function setupScheduling(ctx, endpoint) {
   await ctx.rpc.register(schedulingRpc, { async control(command) {
@@ -133,10 +152,22 @@ export default {
     let inFlight;
 
     await ctx.model.transform(editor => {
-      if (!editor.provider.get("prism")) return;
+      const provider = editor.provider.get("prism");
+      if (!provider) return;
+      // Drop models this transform added before the gateway removed them from
+      // its catalog; a model the user configured stays.
+      for (const model of editor.list("prism")) {
+        if (!ids.includes(model.id) && !provider.models.has(model.id)) editor.remove("prism", model.id);
+      }
       for (const id of ids) {
-        if (editor.get("prism", id)) continue; // Keep user settings, including disabled entries.
         const adapter = rootChat.get(id) || (/^gpt-[56](?:[.-]|$)/.test(id) ? RESPONSES : CHAT);
+        const adaptive = adapter === MESSAGES && isAdaptiveThinkingId(id);
+        if (editor.get("prism", id)) {
+          // Keep user settings, including disabled entries, but repair the adaptive
+          // shape a bare-major Claude model needs to accept an effort field.
+          if (adaptive) editor.update("prism", id, applyAdaptiveThinking);
+          continue;
+        }
         const template = editor.provider.get(adapter === MESSAGES ? "anthropic" : "openai")?.models.get(id);
         editor.update("prism", id, model => {
           model.package = adapter;
@@ -147,21 +178,7 @@ export default {
             model.capabilities = structuredClone(template.capabilities);
           }
           if (adapter === RESPONSES) model.settings = { ...model.settings, reasoningSummary: "detailed" };
-          if (adapter === MESSAGES && isAdaptiveThinkingId(id)) {
-            model.compatibility = { ...model.compatibility, supportsEffortUpdates: true };
-            model.capabilities = { ...model.capabilities, reasoning: { supported: true, effort: ADAPTIVE_THINKING_EFFORTS } };
-            // display defaults to "omitted" on Claude Sonnet 5 and later adaptive-thinking
-            // models, which returns thinking blocks with an empty `thinking` field (only
-            // the opaque `signature` is populated, even though reasoning tokens are spent
-            // and billed). "summarized" is required to get back readable thinking text.
-            model.settings = { ...model.settings, thinking: { type: "adaptive", display: "summarized" } };
-            // capabilities.reasoning drives auto-built variants only for models with
-            // a backing provider template; a model discovered and created purely
-            // through this plugin has none, so the variants are declared explicitly
-            // here. Confirmed live: reasoningEffort reaches output_config.effort for
-            // this protocol once compatibility.supportsEffortUpdates is set above.
-            model.variants = ADAPTIVE_THINKING_EFFORTS.map(effort => ({ id: effort, settings: { reasoningEffort: effort } }));
-          }
+          if (adaptive) applyAdaptiveThinking(model);
         });
       }
     });

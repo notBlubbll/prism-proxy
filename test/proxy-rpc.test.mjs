@@ -20,6 +20,8 @@ async function loadProxyModule(t, { upstream = "http://127.0.0.1:1/doway/v1" } =
   const dir = await mkdtemp(join(tmpdir(), "prism-rpc-"));
   const entry = join(dir, "proxy.mjs");
   await copyFile(new URL("../index.js", import.meta.url), entry);
+  // index.js imports queue-policy.mjs, so the copy needs its siblings too.
+  await copyFile(new URL("../queue-policy.mjs", import.meta.url), join(dir, "queue-policy.mjs"));
   t.after(() => rm(dir, { recursive: true, force: true }));
 
   process.env.PRISM_PROXY_PORT = String(port);

@@ -23,6 +23,12 @@ waits for room, and forwards only when the budget allows it.
 | Requests | 30 / 60s per key | `PRISM_PROXY_GLOBAL_LIMITS` |
 | Tokens | 10,000,000 / 60s per key | `PRISM_PROXY_GLOBAL_TOKEN_LIMITS` |
 
+For a 30 RPM key the normal target is 25, with pacing starting above 20 at the default 80% threshold. Two burst credits allow a 26th and 27th request if the full session forecast is at most 250k tokens and 20% token headroom remains. Credits refill when usage falls to 23 or fewer. Retries also need a slot.
+
+For identified text sessions, admission budgets twice the larger of the estimated full input and the session's latest observed input-plus-output count, plus the explicit output budget. The proxy keeps 20% token headroom when possible. Under contention, smaller eligible requests go first; the focused Desktop session can take precedence when both fit. After three bypasses or five seconds of waiting, an older request can only be passed without delaying its estimated start. Requests within a session stay ordered. An oversized forecast waits for an empty token window. Forecasts do not increase usage or billing.
+
+In the Prism usage panel, **Pause until quiet** holds new requests from the selected session and its descendants; open streams finish normally. The family resumes after five seconds without competing queued work on its keys, after one minute, or with **Resume now**. Use `/prism-background <question>` for a single low-priority turn. Background turns can use spare capacity and do not inherit the Desktop focus preference. The session list shows queued estimates and the next waiting session on each key.
+
 The windows are global across models. Per-model limits are available with
 `PRISM_PROXY_LIMITS` and `PRISM_PROXY_TOKEN_LIMITS` (format `model=30/60s`).
 Each attempt reserves the estimated input plus the requested output budget.
@@ -51,13 +57,16 @@ and the following IDs to `/v1` on the same PrismRouter host:
 | `/v1/images/generations`, `/v1/images/edits` | `gpt-image-2` |
 
 `GET /v1/models` also includes these root IDs when the key's root catalog lists
-them. The panel's default ping list remains Doway-only.
+them. The panel's default ping list covers the root models. PrismRouter can
+remove a Doway model from a key's catalog; the panel then stops offering it and
+the ping list never names it.
 
 ## OpenCode
 
 Copy [`opencode.prism.json`](./opencode.prism.json) into your OpenCode config,
 or merge its `providers.prism` block. It points at
-`http://127.0.0.1:17334/v1` and includes 28 chat models and one image model.
+`http://127.0.0.1:17334/v1` and mirrors the catalog the gateway currently
+returns: eight chat models and one image model.
 Use `prism/gpt-image-2` for image generation; it is not a session chat model.
 
 The provider's `apiKey` is `{env:PRISM_API_KEY}`. With a key in `keys.json` the
@@ -77,11 +86,23 @@ completions endpoint rejects function tools combined with reasoning
 Responses API accepts them. Responses-only models (`gpt-5*-codex`,
 `gpt-5*-pro`) can be added to the `models` map as well.
 
-If a text endpoint returns HTTP 502 before streaming starts, the proxy waits
-and retries the same request while the client stays connected. Each attempt
-uses a rate-limit slot. Canceling the request stops further retries. Other
-transient gateway errors are retried up to five times. An ongoing stream is
-never replayed.
+Bare-major Claude IDs (`claude-sonnet-5`) reject the classic
+`thinking: {type:"enabled"}` request. The usage panel's catalog transform gives
+them `thinking: {type:"adaptive", display:"summarized"}`, marks them as
+supporting per-turn effort, and adds `low`/`medium`/`high`/`xhigh`/`max`
+variants. It does this for models already present in the config too, since a
+bare-major model without the adaptive shape fails with
+`output_config.effort requires a model that supports per-turn effort`.
+The proxy also rewrites that classic shape to adaptive before forwarding, so a
+session started before a config change keeps working.
+
+If a text endpoint returns HTTP 502 or its connection resets before any response
+bytes reach the client, the proxy waits and retries the same request. For HTTP 502
+the delay is 1 second, then 5 seconds, then 10 seconds between subsequent attempts.
+Rate-limit waits can delay dispatch further. Each attempt
+uses a rate-limit slot. Canceling the request stops further retries. If a reset
+interrupts a partially delivered answer, the proxy closes the stream without
+replaying it. Other transient gateway errors are retried up to five times.
 
 ## Keys
 
@@ -138,6 +159,7 @@ Costs are list-price estimates, not what PrismRouter bills.
 | `PRISM_PROXY_KEYS_FILE` | `keys.json` | key/pin store |
 | `PRISM_PROXY_GLOBAL_LIMITS` | `global=30/60s` | global request window |
 | `PRISM_PROXY_GLOBAL_TOKEN_LIMITS` | `global=10000000/60s` | global token window |
+| `PRISM_PROXY_PACE_START_PERCENT` | `80` | Above this projected per-key utilization, space requests by the tighter request or estimated token rate. `100` disables soft pacing; hard limits always apply. |
 | `PRISM_PROXY_LIMITS` | empty | per-model request windows |
 | `PRISM_PROXY_TOKEN_LIMITS` | empty | per-model token windows |
 | `PRISM_PROXY_PRICING` | models.dev table | `model=in/out/cached` USD per 1M |
