@@ -488,3 +488,61 @@ test("A Responses token 429 pauses the key across models and retries the unchang
   assert.ok(status.global["global|1"].tokensUsed >= 128000 && status.global["global|1"].tokensUsed < 256000);
   assert.equal(status.sessions.ses_astra, undefined);
 });
+
+test("Bare-major Claude requests are rewritten to adaptive thinking before forwarding", { timeout: 15000 }, async (t) => {
+  const seen = [];
+  const base = await startProxy(t, async (req, res) => {
+    const bytes = [];
+    for await (const chunk of req) bytes.push(chunk);
+    seen.push(JSON.parse(Buffer.concat(bytes)));
+    res.writeHead(200, { "content-type": "text/event-stream" });
+    res.write('data: {"type":"message_start","message":{"usage":{"input_tokens":1,"output_tokens":0}}}\n\n');
+    res.end('data: {"type":"message_delta","usage":{"output_tokens":1}}\n\n');
+  });
+  const post = body => fetch(`${base}/v1/messages`, {
+    method: "POST",
+    headers: { "content-type": "application/json", "x-api-key": "test" },
+    body: JSON.stringify(body),
+  });
+  await (await post({ model: "claude-sonnet-5", max_tokens: 16, thinking: { type: "enabled", budget_tokens: 1024 }, output_config: { effort: "high" } })).arrayBuffer();
+  assert.deepEqual(seen.at(-1).thinking, { type: "adaptive" });
+  assert.deepEqual(seen.at(-1).output_config, { effort: "high" });
+  await (await post({ model: "claude-opus-4-5", max_tokens: 16, thinking: { type: "enabled", budget_tokens: 1024 }, output_config: { effort: "high" } })).arrayBuffer();
+  assert.deepEqual(seen.at(-1).thinking, { type: "enabled", budget_tokens: 1024 }, "a model without adaptive support keeps its shape");
+  await (await post({ model: "claude-sonnet-5", max_tokens: 16, thinking: { type: "adaptive", display: "summarized" }, output_config: { effort: "xhigh" } })).arrayBuffer();
+  assert.deepEqual(seen.at(-1).thinking, { type: "adaptive", display: "summarized" }, "an adaptive request is left alone");
+});
+
+test("A rejected per-turn effort request is retried without output_config.effort", { timeout: 15000 }, async (t) => {
+  const seen = [];
+  const base = await startProxy(t, async (req, res) => {
+    const bytes = [];
+    for await (const chunk of req) bytes.push(chunk);
+    const body = JSON.parse(Buffer.concat(bytes));
+    seen.push(body);
+    if (body.output_config?.effort) {
+      return res.writeHead(400, { "content-type": "application/json" }).end(JSON.stringify({
+        type: "error",
+        error: { type: "invalid_request_error", message: "output_config.effort requires a model that supports per-turn effort; this model does not" },
+      }));
+    }
+    res.writeHead(200, { "content-type": "text/event-stream" });
+    res.end('data: {"type":"message_delta","usage":{"output_tokens":1}}\n\n');
+  });
+  const response = await fetch(`${base}/v1/messages`, {
+    method: "POST",
+    headers: { "content-type": "application/json", "x-api-key": "test" },
+    body: JSON.stringify({
+      model: "claude-sonnet-5",
+      max_tokens: 2048,
+      thinking: { type: "adaptive" },
+      output_config: { effort: "max" },
+      messages: [{ role: "user", content: "hi" }],
+    }),
+  });
+  await response.arrayBuffer();
+  assert.equal(response.status, 200);
+  assert.equal(seen.length, 2);
+  assert.equal(seen[1].output_config, undefined);
+  assert.deepEqual(seen[1].thinking, { type: "adaptive" });
+});

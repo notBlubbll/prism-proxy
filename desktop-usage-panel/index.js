@@ -152,7 +152,13 @@ export default {
     let inFlight;
 
     await ctx.model.transform(editor => {
-      if (!editor.provider.get("prism")) return;
+      const provider = editor.provider.get("prism");
+      if (!provider) return;
+      // Drop models this transform added before the gateway removed them from
+      // its catalog; a model the user configured stays.
+      for (const model of editor.list("prism")) {
+        if (!ids.includes(model.id) && !provider.models.has(model.id)) editor.remove("prism", model.id);
+      }
       for (const id of ids) {
         const adapter = rootChat.get(id) || (/^gpt-[56](?:[.-]|$)/.test(id) ? RESPONSES : CHAT);
         const adaptive = adapter === MESSAGES && isAdaptiveThinkingId(id);

@@ -57,13 +57,16 @@ and the following IDs to `/v1` on the same PrismRouter host:
 | `/v1/images/generations`, `/v1/images/edits` | `gpt-image-2` |
 
 `GET /v1/models` also includes these root IDs when the key's root catalog lists
-them. The panel's default ping list remains Doway-only.
+them. The panel's default ping list covers the root models. PrismRouter can
+remove a Doway model from a key's catalog; the panel then stops offering it and
+the ping list never names it.
 
 ## OpenCode
 
 Copy [`opencode.prism.json`](./opencode.prism.json) into your OpenCode config,
 or merge its `providers.prism` block. It points at
-`http://127.0.0.1:17334/v1` and includes 28 chat models and one image model.
+`http://127.0.0.1:17334/v1` and mirrors the catalog the gateway currently
+returns: eight chat models and one image model.
 Use `prism/gpt-image-2` for image generation; it is not a session chat model.
 
 The provider's `apiKey` is `{env:PRISM_API_KEY}`. With a key in `keys.json` the
@@ -90,6 +93,8 @@ supporting per-turn effort, and adds `low`/`medium`/`high`/`xhigh`/`max`
 variants. It does this for models already present in the config too, since a
 bare-major model without the adaptive shape fails with
 `output_config.effort requires a model that supports per-turn effort`.
+The proxy also rewrites that classic shape to adaptive before forwarding, so a
+session started before a config change keeps working.
 
 If a text endpoint returns HTTP 502 or its connection resets before any response
 bytes reach the client, the proxy waits and retries the same request. For HTTP 502

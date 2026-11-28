@@ -76,13 +76,11 @@ const ROOT_MODELS = new Map([
   ["grok-4.7", "/chat/completions"], ["gpt-image-2", "/images/generations"],
 ]);
 // Models the panel's "Ping models" button checks when the request names none.
-const PING_MODELS_DEFAULT = [
-  "gpt-6.2-sol", "gpt-6.2-astra", "gpt-6.1-sol", "gpt-6.1-terra",
-  "gpt-6-sol", "gpt-6-luna", "gpt-5.6-terra", "gpt-5.6-luna",
-  "gpt-5.5", "gpt-5.4", "gpt-5.4-nano", "gpt-5.1", "gpt-5",
-  "gpt-4.1", "gpt-4.1-mini", "gpt-4.1-nano", "gpt-4o", "gpt-4o-mini",
-  "gpt-chat-latest", "o3-mini",
-];
+// Root chat models are the ones the gateway still lists; a Doway model can be
+// named explicitly in the request body.
+const PING_MODELS_DEFAULT = [...ROOT_MODELS]
+  .filter(([, endpoint]) => endpoint !== "/images/generations")
+  .map(([id]) => id);
 
 // USD per 1M tokens from models.dev (provider `opencode`, falling back to
 // `openai` for models OpenCode does not list), overridable with PRISM_PROXY_PRICING.
@@ -1978,6 +1976,7 @@ async function handle(req, res) {
   try {
     if (req.headers.authorization) lastAuthHeader = req.headers.authorization;
     if (isChat) body = trimOldImages(body);
+    if (isMessages && model) body = normalizeClaudeThinking(body, model);
     // Normal chat requests too: a body bigger than the model's context is refused
     // upstream ("Provider returned error", 502). Keep the first message and the
     // newest turns, as compaction does.
@@ -2061,6 +2060,7 @@ async function handle(req, res) {
         retry5xx: textRequest,
         signal,
         isMessages, isImage,
+        retryEffort: isMessages,
         retry429: !!model && (textRequest || isImage),
       });
       if (signal.aborted) return;
@@ -2082,6 +2082,18 @@ async function handle(req, res) {
         log(`upstream rejected an image request for ${model} (400); retrying with captions :: ${String(result.text).replace(/\s+/g, " ").slice(0, 160)}`);
         body = await visionHandoff(body, model, req.headers.authorization, true, keySlot, sessionId, policy, signal);
         estTokens = estimateTokens(body, meta.maxTokens);
+        continue;
+      }
+      if (result.effortRejected) {
+        const stripped = dropEffort(body);
+        if (stripped === body) return sendJson(res, result.status, result.text);
+        try {
+          const json = JSON.parse(body.toString("utf8"));
+          log(`effort rejected for ${model}; shape thinking=${JSON.stringify(json.thinking)} output_config=${JSON.stringify(json.output_config)}`);
+        } catch {}
+        body = stripped;
+        estTokens = estimateTokens(body, meta.maxTokens);
+        log(`retrying ${model} without output_config.effort`);
         continue;
       }
       if (result.serverError) {
@@ -2242,6 +2254,11 @@ function forward(req, res, url, body, model, isChat, opts = {}) {
             // The upstream refused a request that carries images: let the caller
             // retry once with the images captioned instead of failing the turn.
             if (status === 400 && opts.imageFallback) return finish({ visionFallback: true, status, text });
+            // Per-turn effort is refused for a model that the gateway did not
+            // classify as supporting it: retry once without the effort field.
+            if (status === 400 && opts.retryEffort && /output_config\.effort requires a model that supports per-turn effort/.test(text)) {
+              return finish({ effortRejected: true, status, headers: rawRes.headers, text });
+            }
             res.writeHead(status, hdrs);
             res.end(text);
             finish({ done: true });
@@ -2465,6 +2482,33 @@ function rewriteModel(body, model) {
   } catch {
     return body;
   }
+}
+
+// Bare-major Claude IDs (claude-sonnet-5) only serve adaptive thinking, and the
+// gateway rejects output_config.effort without it. Rewrite the classic shape a
+// client may still send so a session started before a config change keeps working.
+function normalizeClaudeThinking(body, model) {
+  if (!/^claude-[a-z]+-\d+$/.test(model)) return body;
+  let json;
+  try { json = JSON.parse(body.toString("utf8")); } catch { return body; }
+  const thinking = json.thinking;
+  if (thinking?.type === "adaptive") return body;
+  const wantsEffort = Boolean(json.output_config?.effort);
+  if (!wantsEffort && thinking?.type !== "enabled") return body;
+  const display = thinking?.display;
+  json.thinking = { type: "adaptive", ...(display ? { display } : {}) };
+  return Buffer.from(JSON.stringify(json), "utf8");
+}
+
+// Last resort when the gateway still refuses per-turn effort for a bare-major
+// Claude model: drop the effort field and retry once with adaptive thinking.
+function dropEffort(body) {
+  let json;
+  try { json = JSON.parse(body.toString("utf8")); } catch { return body; }
+  if (!json.output_config || !("effort" in json.output_config)) return body;
+  delete json.output_config.effort;
+  if (Object.keys(json.output_config).length === 0) delete json.output_config;
+  return Buffer.from(JSON.stringify(json), "utf8");
 }
 
 // One upstream attempt, fully buffered. Used only for compaction: the response
