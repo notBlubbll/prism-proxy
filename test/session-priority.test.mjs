@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import plugin from '../desktop-usage-panel/index.js';
+import plugin from '../server/usage.js';
 
 test('A background question covers continuations and children created during the turn, not the next question', async t => {
   t.mock.method(globalThis,'fetch',async () => Response.json({data:[]}));

@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import plugin from "../desktop-usage-panel/index.js";
+import plugin from "../server/usage.js";
 
 test("Existing bare-major Claude models are repaired to adaptive thinking with xhigh", async t => {
   const catalog = ["claude-sonnet-5"];

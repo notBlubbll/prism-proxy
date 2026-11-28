@@ -26,6 +26,7 @@ import zlib from "node:zlib";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import usagePlugin from "./server/usage.js";
 const policyModule = new URL('./queue-policy.mjs', import.meta.url);
 if (globalThis.__prismHotReloading) policyModule.searchParams.set('reload', Date.now());
 const { requestWindow, chooseTicket } = await import(policyModule.href);
@@ -2703,7 +2704,7 @@ function applyKeysUpdate(body) {
 const obj = { type: "object", additionalProperties: true };
 
 export const ProxyRpc = {
-  id: "prism-proxy.panel",
+  id: "prism.panel",
   events: {},
   methods: {
     usage: { input: obj, output: obj },
@@ -2890,7 +2891,7 @@ async function hotReload() {
 }
 
 export default {
-  id: "prism-proxy",
+  id: "prism",
   async setup(ctx) {
     // Registered before startServer's singleton check: the listener is reused
     // across reloads, so setup() returns early there, but the RPC surface must
@@ -2938,8 +2939,23 @@ export default {
     } catch (e) {
       log(`could not register the RPC surface: ${e?.stack || e}`);
     }
-    startServer(Number(process.env.PRISM_PROXY_PORT) || PORT_DEFAULT, "plugin")
-      .catch((e) => log(`startServer failed: ${e?.stack || e}`));
+    // One package, two installs: the machine that serves Prism requests (home)
+    // sets `proxy: true`; a machine that only hosts the Desktop panel sets
+    // `proxy: false` so a second limiter and listener never start there.
+    const proxyEnabled = ctx?.options?.proxy !== false;
+    if (proxyEnabled) {
+      startServer(Number(process.env.PRISM_PROXY_PORT) || PORT_DEFAULT, "plugin")
+        .catch((e) => log(`startServer failed: ${e?.stack || e}`));
+    } else {
+      log("proxy listener disabled by the plugin's `proxy: false` option");
+    }
+
+    // Catalog sync, session scheduling and the model transform live in the same
+    // package and run in the same server, so one install covers both.
+    const disposeUsage = await usagePlugin.setup(ctx);
+    return () => {
+      try { disposeUsage?.(); } catch {}
+    };
   },
 };
 

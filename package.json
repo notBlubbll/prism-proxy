@@ -1,12 +1,26 @@
 {
-  "name": "prism-proxy",
+  "name": "prism",
   "version": "1.0.0",
   "private": true,
-  "description": "OpenAI-compatible proxy for PrismRouter (c00l.site) with a global 30 RPM / 10M TPM limiter and a key pool.",
+  "description": "Prism in OpenCode: an OpenAI-compatible PrismRouter proxy with a global limiter and key pool, its session scheduling, and a Desktop usage panel — one install.",
   "type": "module",
-  "main": "index.js",
+  "main": "./index.js",
+  "exports": {
+    ".": "./index.js",
+    "./server": "./index.js",
+    "./gui-experimental": "./gui-experimental.cjs"
+  },
+  "files": [
+    "index.js",
+    "queue-policy.mjs",
+    "server",
+    "gui-experimental.cjs",
+    "keys.json.example",
+    "README.md"
+  ],
   "scripts": {
-    "start": "node index.js"
+    "start": "node index.js",
+    "test": "node --test"
   },
   "license": "MIT"
 }

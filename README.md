@@ -177,33 +177,59 @@ Costs are list-price estimates, not what PrismRouter bills.
 | `PRISM_PROXY_PING_TIMEOUT_MS` | `30000` | hard limit for one ping |
 | `PRISM_PROXY_PING_WAIT_MS` | `180000` | slot wait for a ping |
 
-## Desktop sidebar panel
+## One plugin: server and panel
 
-`desktop-usage-panel/` adds a **Prism usage** tab to the session side region:
-summary cards, one row per model, a 24u / 24h / 7d / 30d / all switch, a refresh
-button, and a working composer pill. It reads `/usage` and `/status` from the
-proxy on `127.0.0.1:17334`. The key selector appears once there are two keys.
-The panel renders one **Working** pill for the session's active provider. Other
-usage panels can contribute `{ id: providerID, show(input) }` to the GUI registry
-`prism-usage.working-providers` and omit their own pill while the
-`prism-usage.working` contract is active.
+`prism` is a single plugin package with two parts, loaded from one directory:
 
-Install it next to the proxy plugin:
+- **Server** (`index.js`, exporting `{ id: "prism", setup }`): the proxy itself —
+  limiter, key pool, usage accounting, session scheduling, catalog sync and the
+  panel's RPC surface (`prism.panel`: `usage`, `status`, `keysList`,
+  `keysUpdate`, `ping`).
+- **GUI** (`gui-experimental.cjs`): the **Prism usage** tab — summary cards, one
+  row per model, a 24u / 24h / 7d / 30d / all switch, a refresh button, and a
+  working composer pill.
+
+Install the whole package into the global plugin directory and list it once:
+
+```jsonc
+// ~/.config/opencode/opencode.json(c)
+{
+  "plugins": [
+    { "package": "./plugins/prism", "options": { "proxy": true } },
+  ],
+}
+```
 
 ```sh
-cp -r desktop-usage-panel ~/.config/opencode/plugins/prism-usage
+cp -r prism-panel-controls ~/.config/opencode/plugins/prism
 opencode reload
 ```
 
-Open **Prism usage** from the session side panel's **+** menu. OpenCode Desktop
-reloads the local GUI bundle when it changes. Options when the plugin is listed
-in `opencode.jsonc`: `refreshMs` and `usageEndpoint`.
+`proxy` decides whether this machine serves Prism requests. Set `"proxy": true`
+on the machine that runs the proxy (and holds `keys.json`), and `"proxy": false`
+on a machine that only hosts the Desktop panel, so a second limiter and listener
+never start there. Options also include `refreshMs` and, as a legacy local
+fallback, `usageEndpoint`.
+
+Open **Prism usage** from the session side panel's **+** menu. The panel renders
+one **Working** pill for the session's active provider. Other usage panels can
+contribute `{ id: providerID, show(input) }` to the GUI registry
+`prism.working-providers` and omit their own pill while the `prism.working`
+contract is active.
+
+Note that OpenCode Desktop loads a plugin's GUI part from its **own** local
+server, so the package must be installed on the Desktop machine too — with
+`"proxy": false` when the proxy lives elsewhere. The panel reads through the
+plugin's RPC on the session's own server, not a hard-coded `127.0.0.1`, so it
+works when the panel and the proxy are on different machines.
 
 ## Files
 
-- `index.js` - proxy, limiter, key pool, usage accounting
-- `desktop-usage-panel/` - optional OpenCode Desktop sidebar panel
-- `opencode.prism.json` - OpenCode provider block
+- `index.js` - the plugin: proxy, limiter, key pool, usage accounting, RPC surface
+- `server/usage.js` - catalog sync, session scheduling and the model transform
+- `gui-experimental.cjs` - OpenCode Desktop sidebar panel
+- `queue-policy.mjs` - shared focus/background pacing policy
+- `opencode.prism.json` - OpenCode provider block (kept for reference)
 - `keys.json.example` - placeholder key file
 - `keys.json` - real key, git-ignored
 - `.prism-usage.json` / `.prism-usage.jsonl` - usage history, git-ignored

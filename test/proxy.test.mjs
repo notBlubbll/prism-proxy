@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
-import { copyFile, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { copyFile, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { pathToFileURL } from "node:url";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
@@ -23,6 +23,8 @@ async function startProxy(t, handler, limits = {}, clock) {
   const entry = join(dir, "proxy.mjs");
   await copyFile(new URL("../index.js", import.meta.url), entry);
   await copyFile(new URL("../queue-policy.mjs", import.meta.url), join(dir, "queue-policy.mjs"));
+  await mkdir(join(dir, "server"), { recursive: true });
+  await copyFile(new URL("../server/usage.js", import.meta.url), join(dir, "server", "usage.js"));
   const args = [];
   if (clock) {
     const preload = join(dir,'clock.mjs');

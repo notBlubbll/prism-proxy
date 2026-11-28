@@ -24,11 +24,11 @@ function chatCatalog(entries) {
   }).sort();
 }
 
-const catalogRpc = { id: "prism-usage.catalog", events: {}, methods: {
+const catalogRpc = { id: "prism.catalog", events: {}, methods: {
   sync: { input: { type: "object", additionalProperties: false }, output: { type: "array", items: { type: "string" } } },
 } };
 
-const schedulingRpc = { id: "prism-usage.scheduling", events: {}, methods: {
+const schedulingRpc = { id: "prism.scheduling", events: {}, methods: {
   control: { input: { type:"object", required:["action","session"], properties:{ action:{enum:["focus","unfocus","pause","resume"]}, session:{type:"string"}, owner:{type:"string"} }, additionalProperties:false }, output:{type:"boolean"} },
 } };
 
@@ -141,7 +141,7 @@ async function setupScheduling(ctx, endpoint) {
 }
 
 export default {
-  id: "prism-usage",
+  id: "prism",
   async setup(ctx) {
     const endpoint = new URL("v1/models", new URL(".", ctx.options?.usageEndpoint || "http://127.0.0.1:17334/usage"));
     await setupScheduling(ctx,endpoint);

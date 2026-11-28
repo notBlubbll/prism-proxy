@@ -14,10 +14,10 @@
 const { Plugin, Panel, MenuItem, Command, ComposerPill, Registry, Contract } = require("@opencode/plugin/gui");
 const { createComponent, createEffect, createSignal, onCleanup } = require("solid-js");
 const { insert } = require("solid-js/web");
-const catalogRpc = { id: "prism-usage.catalog", events: {}, methods: {
+const catalogRpc = { id: "prism.catalog", events: {}, methods: {
   sync: { input: { type: "object", additionalProperties: false }, output: { type: "array", items: { type: "string" } } },
 } };
-const schedulingRpc = { id:'prism-usage.scheduling', events:{}, methods:{control:{input:{type:'object',required:['action','session'],properties:{action:{enum:['pause','resume','focus','unfocus']},session:{type:'string'},owner:{type:'string'}},additionalProperties:false},output:{type:'boolean'}}} };
+const schedulingRpc = { id:'prism.scheduling', events:{}, methods:{control:{input:{type:'object',required:['action','session'],properties:{action:{enum:['pause','resume','focus','unfocus']},session:{type:'string'},owner:{type:'string'}},additionalProperties:false},output:{type:'boolean'}}} };
 
 // Live retry state from the proxy's /status, read by the composer pill. One
 // signal for every window, refreshed once a second.
@@ -1459,7 +1459,7 @@ module.exports = {
         }
       }, 1000);
 
-      const providers = Registry.define("prism-usage.working-providers");
+      const providers = Registry.define("prism.working-providers");
       ctx.add(providers, {
         id: "prism",
         show: (input) => {
@@ -1481,7 +1481,7 @@ module.exports = {
           return ctx.list(providers).find((entry) => entry.id === provider)?.show(input);
         },
       };
-      ctx.provide(Contract.define("prism-usage.working"), working);
+      ctx.provide(Contract.define("prism.working"), working);
       ctx.add(ComposerPill, { id: "working", order: 5, show: working.show });
 
       const tab = {

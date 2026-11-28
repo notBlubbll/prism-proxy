@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import { once } from "node:events";
-import { copyFile, mkdtemp, rm } from "node:fs/promises";
+import { copyFile, mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -20,8 +20,11 @@ async function loadProxyModule(t, { upstream = "http://127.0.0.1:1/doway/v1" } =
   const dir = await mkdtemp(join(tmpdir(), "prism-rpc-"));
   const entry = join(dir, "proxy.mjs");
   await copyFile(new URL("../index.js", import.meta.url), entry);
-  // index.js imports queue-policy.mjs, so the copy needs its siblings too.
+  // index.js imports queue-policy.mjs and server/usage.js, so the copy needs
+  // its siblings too.
   await copyFile(new URL("../queue-policy.mjs", import.meta.url), join(dir, "queue-policy.mjs"));
+  await mkdir(join(dir, "server"), { recursive: true });
+  await copyFile(new URL("../server/usage.js", import.meta.url), join(dir, "server", "usage.js"));
   t.after(() => rm(dir, { recursive: true, force: true }));
 
   process.env.PRISM_PROXY_PORT = String(port);
@@ -37,16 +40,27 @@ async function loadProxyModule(t, { upstream = "http://127.0.0.1:1/doway/v1" } =
 
   const mod = await import(pathToFileURL(entry).href);
 
-  let captured = null;
-  const fakeCtx = { rpc: { register: (_def, impl) => { captured = impl; return { dispose() {} }; } } };
-  await mod.default.setup(fakeCtx);
-  assert.ok(captured, "setup() must register an RPC implementation on ctx.rpc");
+  // The merged package also runs the catalog/scheduling part in the same setup(),
+  // so the fake context needs the surfaces that part touches.
+  const impls = {};
+  const fakeCtx = {
+    options: { usageEndpoint: "http://127.0.0.1:1/usage" }, // never reach the real proxy
+    rpc: { register: (def, impl) => { impls[def.id] = impl; return { dispose() {} }; } },
+    command: { transform: async () => {} },
+    session: { hook: async () => {}, get: async () => undefined, prompt: async () => {} },
+    storage: { get: async () => undefined, set: async () => {}, remove: async () => {}, scan: async () => ({ entries: [] }) },
+    model: { transform: async () => {}, reload: async () => {} },
+  };
+  const dispose = await mod.default.setup(fakeCtx);
+  const impl = impls["prism.panel"];
+  assert.ok(impl, "setup() must register the panel RPC on ctx.rpc");
 
   t.after(() => {
+    try { dispose?.(); } catch {}
     const server = globalThis.__prismProxyServer;
     if (server) try { server.__prismShutdown?.(); } catch {}
   });
-  return { mod, impl: captured };
+  return { mod, impl };
 }
 
 test("usage RPC returns the same report GET /usage would", async (t) => {
