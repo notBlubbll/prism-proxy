@@ -48,7 +48,7 @@ async function startProxy(t, handler, limits = {}, clock) {
 for (const dimension of ["requests", "tokens"]) {
   test(`Paces queued requests near the per-key ${dimension} limit before exhausting it`, async (t) => {
     const times = [];
-    const body = JSON.stringify({ model: "gpt-6.2-astra", input: "ping" });
+    const body = JSON.stringify({ model: "gpt-6.2-astra", input: "ping", stream: true });
     const estimate = Math.ceil(body.length / 4);
     const base = await startProxy(t, (req, res) => {
       times.push(Date.now());
@@ -80,7 +80,7 @@ for (const dimension of ["requests", "tokens"]) {
 
 for (const dimension of ["requests", "tokens"]) {
   test(`Resumes pacing early when old ${dimension} leave the rolling window`, async (t) => {
-    const body = JSON.stringify({ model: "gpt-6.2-astra", input: "ping" });
+    const body = JSON.stringify({ model: "gpt-6.2-astra", input: "ping", stream: true });
     const estimate = Math.ceil(body.length / 4);
     const base = await startProxy(t, (req, res) => {
       req.resume();
@@ -450,7 +450,7 @@ test("Root aliases use their native APIs, the pooled key, and the shared usage w
 test("A Responses token 429 pauses the key across models and retries the unchanged body", { timeout: 15000 }, async (t) => {
   const calls = [];
   const statusPath = "/status";
-  const body = JSON.stringify({ model: "gpt-6.2-astra", input: "ping", max_output_tokens: 128000 });
+  const body = JSON.stringify({ model: "gpt-6.2-astra", input: "ping", max_output_tokens: 128000, stream: true });
   const base = await startProxy(t, async (req, res) => {
     const request = await new Response(req).text();
     calls.push({ request, at: Date.now() });
@@ -474,7 +474,7 @@ test("A Responses token 429 pauses the key across models and retries the unchang
   }
   assert.equal(cooldown.sessions.ses_astra?.status, 429);
   assert.ok(cooldown.global["global|1"].blockedMs > 0 && cooldown.global["global|1"].blockedMs <= 1000);
-  const other = JSON.stringify({ model: "gpt-6.2-sol", input: "ping", max_output_tokens: 64 });
+  const other = JSON.stringify({ model: "gpt-6.2-sol", input: "ping", max_output_tokens: 64, stream: true });
   const results = await Promise.all([retry, post(other, "ses_sol")]);
   for (const response of results) {
     assert.equal(response.status, 200);
@@ -545,4 +545,24 @@ test("A rejected per-turn effort request is retried without output_config.effort
   assert.equal(seen.length, 2);
   assert.equal(seen[1].output_config, undefined);
   assert.deepEqual(seen[1].thinking, { type: "adaptive" });
+});
+
+test("A text request that omits stream is forwarded with streaming enabled", { timeout: 15000 }, async (t) => {
+  const seen = [];
+  const base = await startProxy(t, async (req, res) => {
+    const bytes = [];
+    for await (const chunk of req) bytes.push(chunk);
+    seen.push(JSON.parse(Buffer.concat(bytes)));
+    res.writeHead(200, { "content-type": "text/event-stream" });
+    res.end('data: {"type":"message_delta","usage":{"output_tokens":1}}\n\n');
+  });
+  const post = body => fetch(`${base}/v1/messages`, {
+    method: "POST",
+    headers: { "content-type": "application/json", "x-api-key": "test" },
+    body: JSON.stringify(body),
+  });
+  await (await post({ model: "claude-sonnet-5", max_tokens: 16, messages: [{ role: "user", content: "hi" }] })).arrayBuffer();
+  assert.equal(seen[0].stream, true, "an omitted stream defaults to streaming");
+  await (await post({ model: "claude-sonnet-5", max_tokens: 16, stream: false, messages: [{ role: "user", content: "hi" }] })).arrayBuffer();
+  assert.equal(seen[1].stream, false, "an explicit false is kept");
 });

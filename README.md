@@ -96,6 +96,9 @@ bare-major model without the adaptive shape fails with
 The proxy also rewrites that classic shape to adaptive before forwarding, so a
 session started before a config change keeps working.
 
+Text requests stream by default: a request that omits `stream` is forwarded with
+streaming enabled, while an explicit `stream: false` keeps a buffered reply.
+
 If a text endpoint returns HTTP 502 or its connection resets before any response
 bytes reach the client, the proxy waits and retries the same request. For HTTP 502
 the delay is 1 second, then 5 seconds, then 10 seconds between subsequent attempts.

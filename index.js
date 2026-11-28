@@ -1977,6 +1977,7 @@ async function handle(req, res) {
     if (req.headers.authorization) lastAuthHeader = req.headers.authorization;
     if (isChat) body = trimOldImages(body);
     if (isMessages && model) body = normalizeClaudeThinking(body, model);
+    if ((isChat || isMessages || isResponses) && model) body = defaultStream(body);
     // Normal chat requests too: a body bigger than the model's context is refused
     // upstream ("Provider returned error", 502). Keep the first message and the
     // newest turns, as compaction does.
@@ -2508,6 +2509,16 @@ function dropEffort(body) {
   if (!json.output_config || !("effort" in json.output_config)) return body;
   delete json.output_config.effort;
   if (Object.keys(json.output_config).length === 0) delete json.output_config;
+  return Buffer.from(JSON.stringify(json), "utf8");
+}
+
+// Text requests stream by default: a client that omits `stream` gets the upstream
+// SSE stream, while an explicit false still asks for a buffered reply.
+function defaultStream(body) {
+  let json;
+  try { json = JSON.parse(body.toString("utf8")); } catch { return body; }
+  if (!json || typeof json !== "object" || "stream" in json) return body;
+  json.stream = true;
   return Buffer.from(JSON.stringify(json), "utf8");
 }
 
