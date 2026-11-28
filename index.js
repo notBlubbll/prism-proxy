@@ -1626,44 +1626,8 @@ async function handle(req, res) {
       let body = {};
       try { body = JSON.parse(raw.toString("utf8") || "{}"); } catch {}
 
-      if (Array.isArray(body.keys)) {
-        keyPool = [...new Set(body.keys.map((k) => String(k).trim()).filter(Boolean))].slice(0, MAX_KEYS);
-      } else if (Number.isInteger(body.set) && typeof body.key === "string" && body.key.trim()) {
-        // Address one slot directly, which is what the panel's Key 1 / Key 2
-        // fields use.
-        const n = body.set;
-        if (n < 1 || n > MAX_KEYS) return sendJson(res, 400, JSON.stringify({ error: `slot must be 1..${MAX_KEYS}` }));
-        const k = body.key.trim();
-        while (keyPool.length < n) keyPool.push("");
-        keyPool[n - 1] = k;
-        keyPool = keyPool.filter(Boolean).slice(0, MAX_KEYS);
-      } else if (body.pin && typeof body.pin.session === "string" && Number.isInteger(body.pin.key)) {
-        const slot = body.pin.key;
-        if (slot < 1 || slot > keyPool.length) {
-          return sendJson(res, 400, JSON.stringify({ error: `no key ${slot}; ${keyPool.length} configured` }));
-        }
-        sessionKeyPins.set(body.pin.session, slot);
-        const a = sessionActivity.get(body.pin.session);
-        if (a) a.slots = []; // reset: the old slots were on a different key's limiter
-        log(`pinned session ${body.pin.session} to key ${slot}`);
-      } else if (typeof body.unpin === "string") {
-        sessionKeyPins.delete(body.unpin);
-        log(`unpinned session ${body.unpin}`);
-      } else if (typeof body.add === "string" && body.add.trim()) {        const k = body.add.trim();
-        if (keyPool.includes(k)) return sendJson(res, 409, JSON.stringify({ error: "key already configured" }));
-        if (keyPool.length >= MAX_KEYS) return sendJson(res, 409, JSON.stringify({ error: `at most ${MAX_KEYS} keys` }));
-        keyPool.push(k);
-      } else if (Number.isInteger(body.remove) && body.remove >= 1) {
-        if (body.remove <= keyPool.length) {
-          keyPool.splice(body.remove - 1, 1);
-          remapPinsAfterRemoval(body.remove);
-        }
-      } else {
-        return sendJson(res, 400, JSON.stringify({ error: 'send {"keys":[...]}, {"add":"<key>"} or {"remove":<index>}' }));
-      }
-
-      saveKeys();
-      log(`keys updated: ${keyPool.length} configured (${keyPool.map(maskKey).join(", ") || "none"})`);
+      const result = applyKeysUpdate(body);
+      if (!result.ok) return sendJson(res, result.status, JSON.stringify({ error: result.error }));
       return send(res, 200, "application/json", JSON.stringify(keysReport(), null, 2) + "\n", CORS_HEADERS);
     }
   }
@@ -1681,11 +1645,11 @@ async function handle(req, res) {
       : (process.env.PRISM_PROXY_PING_MODELS || PING_MODELS_DEFAULT.join(","))
         .split(",").map((s) => s.trim()).filter(Boolean);
 
-    const auth = req.headers.authorization || lastAuthHeader;
+    if (req.headers.authorization) lastAuthHeader = req.headers.authorization;
     log(`ping ${models.length} model(s) via POST /ping: ${models.join(" ")}`);
-    const results = await pingModels(models, auth);
-    log(`ping done: ${results.map((r) => `${r.model}=${r.ok ? "ok" : r.skipped ? "skipped" : "fail"}`).join(" ")}`);
-    return send(res, 200, "application/json", JSON.stringify({ updated: Date.now(), prompt: PING_PROMPT, results }, null, 2) + "\n",
+    const reply = await runPing({ models });
+    log(`ping done: ${reply.results.map((r) => `${r.model}=${r.ok ? "ok" : r.skipped ? "skipped" : "fail"}`).join(" ")}`);
+    return send(res, 200, "application/json", JSON.stringify(reply, null, 2) + "\n",
       { "cache-control": "no-store", "access-control-allow-origin": "*" });
   }
   if (req.method === "GET" && url.pathname === "/usage") {
@@ -2469,6 +2433,94 @@ function sendJson(res, status, text, headers) {
   send(res, status, type, text || `{"error":{"message":"upstream ${status}"}}`, headers);
 }
 
+// ---- key mutations ---------------------------------------------------------
+// One implementation for both POST /keys and the keysUpdate RPC, so the two can
+// never drift apart. Returns { ok: true } or { ok: false, status, error }; the
+// HTTP handler forwards `status`, the RPC method throws with `error`.
+function applyKeysUpdate(body) {
+  if (Array.isArray(body.keys)) {
+    keyPool = [...new Set(body.keys.map((k) => String(k).trim()).filter(Boolean))].slice(0, MAX_KEYS);
+  } else if (Number.isInteger(body.set) && typeof body.key === "string" && body.key.trim()) {
+    // Address one slot directly, which is what the panel's Key 1 / Key 2
+    // fields use.
+    const n = body.set;
+    if (n < 1 || n > MAX_KEYS) return { ok: false, status: 400, error: `slot must be 1..${MAX_KEYS}` };
+    const k = body.key.trim();
+    while (keyPool.length < n) keyPool.push("");
+    keyPool[n - 1] = k;
+    keyPool = keyPool.filter(Boolean).slice(0, MAX_KEYS);
+  } else if (body.pin && typeof body.pin.session === "string" && Number.isInteger(body.pin.key)) {
+    const slot = body.pin.key;
+    if (slot < 1 || slot > keyPool.length) {
+      return { ok: false, status: 400, error: `no key ${slot}; ${keyPool.length} configured` };
+    }
+    sessionKeyPins.set(body.pin.session, slot);
+    const a = sessionActivity.get(body.pin.session);
+    if (a) a.slots = []; // reset: the old slots were on a different key's limiter
+    log(`pinned session ${body.pin.session} to key ${slot}`);
+  } else if (typeof body.unpin === "string") {
+    sessionKeyPins.delete(body.unpin);
+    log(`unpinned session ${body.unpin}`);
+  } else if (typeof body.add === "string" && body.add.trim()) {
+    const k = body.add.trim();
+    if (keyPool.includes(k)) return { ok: false, status: 409, error: "key already configured" };
+    if (keyPool.length >= MAX_KEYS) return { ok: false, status: 409, error: `at most ${MAX_KEYS} keys` };
+    keyPool.push(k);
+  } else if (Number.isInteger(body.remove) && body.remove >= 1) {
+    if (body.remove <= keyPool.length) {
+      keyPool.splice(body.remove - 1, 1);
+      remapPinsAfterRemoval(body.remove);
+    }
+  } else {
+    return { ok: false, status: 400, error: 'send {"keys":[...]}, {"add":"<key>"} or {"remove":<index>}' };
+  }
+
+  saveKeys();
+  log(`keys updated: ${keyPool.length} configured (${keyPool.map(maskKey).join(", ") || "none"})`);
+  return { ok: true };
+}
+
+// ---- RPC (OpenCode plugin) -------------------------------------------------
+// The Desktop panel reads these over its own server connection instead of a raw
+// fetch to 127.0.0.1, so it keeps working when the panel and the proxy are on
+// different machines. Deliberately absent: key reveal, which stays HTTP-only and
+// loopback-restricted.
+const obj = { type: "object", additionalProperties: true };
+
+export const ProxyRpc = {
+  id: "prism-proxy.panel",
+  events: {},
+  methods: {
+    usage: { input: obj, output: obj },
+    status: { input: obj, output: obj },
+    keysList: { input: obj, output: obj },
+    keysUpdate: {
+      input: obj,
+      output: obj,
+      errors: {
+        rejected: {
+          type: "object",
+          properties: { status: { type: "number" }, error: { type: "string" } },
+          required: ["status", "error"],
+          additionalProperties: false,
+        },
+      },
+    },
+    ping: { input: obj, output: obj },
+  },
+};
+
+async function runPing(config) {
+  const requested = Array.isArray(config?.models) ? config.models.filter((m) => typeof m === "string" && m) : null;
+  const models = requested && requested.length
+    ? [...new Set(requested)]
+    : (process.env.PRISM_PROXY_PING_MODELS || PING_MODELS_DEFAULT.join(","))
+      .split(",").map((s) => s.trim()).filter(Boolean);
+  const auth = lastAuthHeader || null;
+  const results = await pingModels(models, auth);
+  return { updated: Date.now(), prompt: PING_PROMPT, results };
+}
+
 // ---- server ----------------------------------------------------------------
 
 async function startServer(port, mode) {
@@ -2625,6 +2677,52 @@ async function hotReload() {
 export default {
   id: "prism-proxy",
   async setup(ctx) {
+    // Registered before startServer's singleton check: the listener is reused
+    // across reloads, so setup() returns early there, but the RPC surface must
+    // still exist on every load. OpenCode disposes the previous registration.
+    try {
+      if (ctx?.rpc?.register) {
+        await ctx.rpc.register(ProxyRpc, {
+          usage: () => usageReport(),
+          status: () => {
+            const now = Date.now();
+            const accountKeys = Math.max(1, keyPool.length);
+            const global = {};
+            for (const [name, lim] of globalLimiters) global[name] = lim.snapshot(now);
+            return {
+              proxy: "prism-proxy",
+              instance: INSTANCE_ID,
+              upstream: UPSTREAM.href,
+              uptimeMs: now - PROXY_STATE.started,
+              active: PROXY_STATE.active,
+              queued: PROXY_STATE.queued,
+              requests: PROXY_STATE.requests,
+              retries429: PROXY_STATE.retries,
+              retries5xx: PROXY_STATE.retries5xx || 0,
+              sessions: sessionRetryReport(now),
+              keys: accountKeys,
+              global: global,
+              updated: now,
+            };
+          },
+          keysList: () => keysReport(),
+          keysUpdate: (input, context) => {
+            const result = applyKeysUpdate(input || {});
+            if (!result.ok) {
+              // Declared error, so the panel receives { status, error } instead
+              // of an opaque transport failure.
+              const rejected = context?.error?.("rejected", result.error, { status: result.status, error: result.error });
+              if (rejected) throw rejected;
+              throw new Error(result.error);
+            }
+            return keysReport();
+          },
+          ping: (input) => runPing(input || {}),
+        });
+      }
+    } catch (e) {
+      log(`could not register the RPC surface: ${e?.stack || e}`);
+    }
     startServer(Number(process.env.PRISM_PROXY_PORT) || PORT_DEFAULT, "plugin")
       .catch((e) => log(`startServer failed: ${e?.stack || e}`));
   },
